@@ -2614,8 +2614,33 @@ impl Client {
         self.locale.load().format(key, arguments)
     }
 
-    /// Channel-name translations for this client's language, if any exist.
+    /// Whether outbound channel names are translated for this client. Clients
+    /// holding `no_channel_name_translation` always receive the names as
+    /// entered.
+    pub(crate) fn sees_translated_channel_names(&self) -> bool {
+        !self.has_privilege(shitspeak_core::Privilege::NoChannelNameTranslation)
+    }
+
+    /// The channel name to show this client: the raw name as entered when it
+    /// holds `no_channel_name_translation`, otherwise the translation for its
+    /// language when one exists.
+    pub(crate) fn displayed_channel_name(&self, raw: &str) -> String {
+        if !self.sees_translated_channel_names() {
+            return raw.to_owned();
+        }
+        let locale = self.locale.load();
+        locale
+            .channel_names()
+            .translate(locale.language(), raw)
+            .unwrap_or_else(|| raw.to_owned())
+    }
+
+    /// Channel-name translations for this client's language, if any exist and
+    /// the client is shown translated names at all.
     fn channel_name_map(&self) -> Option<Arc<crate::localization::channel_names::ChannelNameMap>> {
+        if !self.sees_translated_channel_names() {
+            return None;
+        }
         let locale = self.locale.load();
         locale.channel_names().for_language(locale.language())
     }

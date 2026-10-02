@@ -23,6 +23,7 @@ use crate::application::proto::{
     self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoicePathFeedback,
 };
 use crate::application::voice::budget::{ProactiveCreditPermit, ProactiveCreditRequest};
+use crate::application::voice::capability;
 use crate::application::voice::fec;
 use crate::application::voice::metrics;
 use crate::application::voice::metrics::{
@@ -446,7 +447,12 @@ impl VoiceService {
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let sender_epoch = overlay.local_boot_epoch();
-        let transport: Arc<dyn VoiceTransport> = Arc::new(OverlayVoiceTransport { overlay });
+        capability::spawn_publisher(
+            overlay.clone(),
+            cfg.voice_fec_enabled && cfg.voice_fec_sliding_window >= 2,
+            shutdown.clone(),
+        );
+        let transport: Arc<dyn VoiceTransport> = Arc::new(OverlayVoiceTransport::new(overlay));
         Self::new_with_transport_and_capacity_source(
             transport,
             cfg,
@@ -501,6 +507,7 @@ impl VoiceService {
             cfg.voice_fec_receiver_window,
             cfg.voice_fec_block_size,
             cfg.voice_fec_interleave_depth,
+            cfg.voice_fec_sliding_window,
         )));
         spawn_dispatch_task(
             primary_inbox_rx,
@@ -526,11 +533,14 @@ impl VoiceService {
             let _ = deadline_tx.try_send(());
         });
         let delivery_strategy = DeliveryStrategy::parse(&cfg.delivery_strategy);
-        let fec_sender = Arc::new(fec::FecSenderState::new(
-            cfg.voice_fec_block_size,
-            cfg.voice_fec_parity_blocks,
-            cfg.voice_fec_interleave_depth,
-        ));
+        let fec_sender = Arc::new(
+            fec::FecSenderState::new(
+                cfg.voice_fec_block_size,
+                cfg.voice_fec_parity_blocks,
+                cfg.voice_fec_interleave_depth,
+            )
+            .with_sliding_window(cfg.voice_fec_sliding_window),
+        );
         Arc::new(Self {
             transport,
             cfg,
@@ -1227,7 +1237,9 @@ impl VoiceService {
             // One stream for the whole tree: the tree carries every row to
             // every recipient, whatever route each edge is bound to.
             let local = self.transport.local_node_id();
-            let emissions = self.fec_sender.push(
+            let sliding =
+                self.fec_sender.sliding_enabled() && self.transport.voice_fec_sliding_capable(dsts);
+            let emissions = self.fec_sender.push_with_code(
                 local,
                 dsts,
                 sender_session,
@@ -1235,6 +1247,7 @@ impl VoiceService {
                 seq,
                 payload.clone(),
                 is_terminator,
+                sliding,
             );
             // A second copy of every row detours around the first hop(s) the
             // data leaves on, where such a route exists, so one burst on the
@@ -1281,7 +1294,9 @@ impl VoiceService {
             }
         }
         for (first_hop, group) in hops {
-            let emissions = self.fec_sender.push(
+            let sliding = self.fec_sender.sliding_enabled()
+                && self.transport.voice_fec_sliding_capable(&group.dsts);
+            let emissions = self.fec_sender.push_with_code(
                 first_hop,
                 &group.dsts,
                 sender_session,
@@ -1289,6 +1304,7 @@ impl VoiceService {
                 seq,
                 payload.clone(),
                 is_terminator,
+                sliding,
             );
             // Send-path pressure gate: while the first-hop datagram lane is
             // evicting (frames shed before the wire), parity sent over it would
@@ -1876,10 +1892,7 @@ fn spawn_dispatch_task(
             let source = transport.local_node_id();
             let (report, inbound_labels, _inbound_permit) = match event {
                 DispatchEvent::Inbound(InboundVoiceWork { delivery, _permit }) => {
-                    let origin_node = shitspeak_core::ClientSessionIdentifier::from(
-                        delivery.frame.sender_session,
-                    )
-                    .get_node_id();
+                    let origin_node = session_origin_node(delivery.frame.sender_session);
                     let from = delivery.from;
                     let sender_session = delivery.frame.sender_session;
                     let sender_epoch = delivery.frame.sender_epoch;
@@ -1984,7 +1997,18 @@ fn spawn_dispatch_task(
             };
             metrics::set_reorder_pending(source, report.pending_total());
             for late in report.late_arrivals() {
-                metrics::record_late_arrival(late.copy_kind(), late.after_release());
+                metrics::record_late_arrival(
+                    session_origin_node(late.sender_session()),
+                    late.copy_kind(),
+                    late.after_release(),
+                    late.first(),
+                );
+            }
+            for run in report.released_runs() {
+                metrics::record_released_run(
+                    session_origin_node(run.sender_session()),
+                    run.missing_frames(),
+                );
             }
             metrics::set_reorder_speaker_state(
                 reorderer.tracked_speaker_count(),
@@ -2235,7 +2259,10 @@ fn push_fec_recovered(
                 None,
                 VoiceCopyKind::Fec,
             );
-            metrics::record_fec_recovery(pushed.result_counts());
+            metrics::record_fec_recovery(
+                session_origin_node(sender_session),
+                pushed.result_counts(),
+            );
             report = Some(match report {
                 Some(report) => report.merge(pushed),
                 None => pushed,
@@ -2243,6 +2270,11 @@ fn push_fec_recovered(
         }
     }
     report
+}
+
+/// The node a speaker session belongs to: the voice stream's origin.
+fn session_origin_node(sender_session: u32) -> NodeIdentifier {
+    shitspeak_core::ClientSessionIdentifier::from(sender_session).get_node_id()
 }
 
 fn publish_ingress_budget(budget: &AdaptiveVoiceBudget) {
@@ -5116,6 +5148,124 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(sink.snapshot().len(), 4);
+    }
+
+    /// The block-code scenario above, with the stream coded by sliding-window
+    /// parity instead: the equation sent with the lost frame 3 lands before
+    /// frame 4, so 3 is rebuilt as soon as it is due and plays in order — the
+    /// reorder never releases past it.
+    #[tokio::test]
+    async fn sliding_parity_recovers_a_loss_in_order_before_the_reorder_releases_past_it() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+
+        let members: [&[u8]; 4] = [b"aaaa", b"bb", b"cccccc", b"dddd"];
+        let sender = fec::FecSenderState::new(3, 3, 2).with_sliding_window(4);
+        let parity: Vec<Vec<Bytes>> = members
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                sender
+                    .push_with_code(
+                        3,
+                        &[7],
+                        0xABC,
+                        42,
+                        index as u64 + 1,
+                        Bytes::copy_from_slice(payload),
+                        false,
+                        true,
+                    )
+                    .iter()
+                    .map(|emission| emission.encode(0xABC, 42).unwrap())
+                    .collect()
+            })
+            .collect();
+        let inject_parity = |seq: u64| {
+            for body in &parity[seq as usize - 1] {
+                inject_voice_inbound(&svc, 11, body.clone());
+            }
+        };
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, members[0]));
+        inject_parity(1);
+        inject_voice_inbound(&svc, 11, fec_data_frame(2, members[1]));
+        inject_parity(2);
+        wait_for_fec_sink(&sink, 2).await;
+        // Frame 3 is lost; the equation sent with it is not.
+        inject_parity(3);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(4, members[3]));
+
+        let frames = wait_for_fec_sink(&sink, 4).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(order, vec![1, 2, 3, 4]);
+        assert_eq!(frames[2].1.as_ref(), members[2]);
+    }
+
+    #[tokio::test]
+    async fn fec_codes_a_stream_with_sliding_parity_only_when_every_recipient_advertises_it() {
+        for (capable, sliding) in [(vec![1, 2], true), (vec![1], false), (vec![], false)] {
+            let transport = FakeVoiceTransport::new(7, vec![1, 2]);
+            for dst in [1, 2] {
+                transport.set_voice_route_quality(
+                    dst,
+                    VoiceRouteQuality::new(1, TransportKind::Udp, 1_000, 0, 0),
+                );
+            }
+            for &dst in &capable {
+                transport.set_fec_sliding_capable(dst);
+            }
+            let mut cfg: VoiceConfig = serde_json::from_str(r#"{"repair_enabled":false}"#).unwrap();
+            cfg.tree_delivery_enabled = false;
+            let svc = VoiceService::new_with_transport(
+                transport.clone(),
+                cfg,
+                CancellationToken::new(),
+                42,
+            );
+            for _ in 0..6 {
+                svc.send_broadcast(
+                    0xABC,
+                    shitspeak_core::default_server_id(),
+                    0,
+                    false,
+                    Bytes::from_static(b"abcd"),
+                    normal_intent(5),
+                )
+                .await
+                .unwrap();
+            }
+            let indices: Vec<u32> = transport
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    FakeCall::Multicast { body, .. } => {
+                        let frame = proto::decode_voice(body).unwrap();
+                        frame.fec_parity.then_some(frame.fec_parity_index)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!indices.is_empty(), "capable {capable:?}");
+            if sliding {
+                // One equation per frame, none of it readable as a block row.
+                assert_eq!(indices, vec![fec::SLIDING_PARITY_INDEX_BASE; 6]);
+            } else {
+                assert!(
+                    indices
+                        .iter()
+                        .all(|index| fec::rs_parity_row(*index).is_some()),
+                    "capable {capable:?}: {indices:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

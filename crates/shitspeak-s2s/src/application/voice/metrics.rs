@@ -102,9 +102,13 @@ pub(crate) enum VoiceReceiveResult {
     BufferDrop,
     NoSinkDrop,
     SpeakerStateDrop,
-    /// A FEC reconstruction emitted out of order into a hole the reorder had
-    /// already released past.
-    FecLate,
+    /// A copy of a sequence the reorder had already released past, emitted
+    /// out of order into the hole, once, within the late-fill window.
+    /// Whichever copy kind gets there first fills; the `copy` label is that
+    /// winner. Exported as `result="late_fill"` plus a `copy` label.
+    LateFill {
+        copy: VoiceCopyKind,
+    },
 }
 
 impl VoiceReceiveResult {
@@ -118,7 +122,7 @@ impl VoiceReceiveResult {
             Self::BufferDrop => "buffer_drop",
             Self::NoSinkDrop => "no_sink_drop",
             Self::SpeakerStateDrop => "speaker_state_drop",
-            Self::FecLate => "fec_late",
+            Self::LateFill { .. } => "late_fill",
         }
     }
 }
@@ -136,8 +140,10 @@ pub(crate) enum DuplicateReason {
     RepairWithoutGap,
     /// An equal or better copy of the same sequence was already buffered.
     AlreadyBuffered,
-    /// Arrived after a deadline flush released past its sequence without it:
-    /// genuinely late, the listener never received it.
+    /// Arrived after a deadline flush released past its sequence without it,
+    /// and outside the late-fill window (or as a terminator): not emitted.
+    /// A default client keeps only a 10 ms margin plus its learned jitter
+    /// delay, so a copy this late is past that listener's playout point.
     LateAfterRelease,
     /// The sequence was already delivered, by a copy of this kind.
     AlreadyDelivered(VoiceCopyKind),
@@ -169,7 +175,8 @@ pub(crate) enum FecRecoveryOutcome {
     InTime,
     /// Emitted out of order into an already released hole.
     Late,
-    /// Rejected by the reorder (duplicate, too late, or buffer limits).
+    /// Rejected by the reorder (duplicate, past the late-fill window, buffer
+    /// limits) or lost the race to a copy that filled the hole first.
     Discarded,
 }
 
@@ -426,9 +433,12 @@ struct VoiceAppMetrics {
     gap_resolutions: HashMap<GapResolution, u64>,
     fec_sends: HashMap<FecSendKey, u64>,
     fec_send_bytes: HashMap<(NodeIdentifier, FecSendOutcome, FecParityPath), u64>,
-    fec_recoveries: HashMap<FecRecoveryOutcome, u64>,
+    fec_recoveries: HashMap<(NodeIdentifier, FecRecoveryOutcome), u64>,
     gaps_opened: HashMap<&'static str, u64>,
-    late_arrivals: HashMap<(VoiceCopyKind, &'static str), u64>,
+    late_arrivals: HashMap<(NodeIdentifier, VoiceCopyKind, &'static str), u64>,
+    released_hole_first_copies: HashMap<(NodeIdentifier, VoiceCopyKind, &'static str), u64>,
+    released_holes: HashMap<NodeIdentifier, u64>,
+    released_gap_runs: HashMap<(NodeIdentifier, &'static str), u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_credit_quarters: HashMap<RepairCreditStage, u64>,
@@ -527,21 +537,58 @@ pub(crate) fn record_gap_opened(missing_frames: u64) {
         .or_default() += 1;
 }
 
-/// Record a copy of a sequence arriving `after_release` after the reorder had
-/// already released past it.
-pub(crate) fn record_late_arrival(copy: VoiceCopyKind, after_release: Duration) {
+/// Record a copy of a sequence from `origin_node` arriving `after_release`
+/// after the reorder had already released past it. `first` marks the first
+/// copy of any kind to reach that hole, which also lands in the per-hole
+/// first-copy histogram: released holes minus first copies is the number of
+/// holes no copy ever reached.
+pub(crate) fn record_late_arrival(
+    origin_node: NodeIdentifier,
+    copy: VoiceCopyKind,
+    after_release: Duration,
+    first: bool,
+) {
     let millis = u64::try_from(after_release.as_millis()).unwrap_or(u64::MAX);
+    let bucket = bucket(&LATE_ARRIVAL_MS_BUCKETS, millis);
     let mut metrics = METRICS.lock().unwrap();
     *metrics
         .late_arrivals
-        .entry((copy, bucket(&LATE_ARRIVAL_MS_BUCKETS, millis)))
+        .entry((origin_node, copy, bucket))
+        .or_default() += 1;
+    if first {
+        *metrics
+            .released_hole_first_copies
+            .entry((origin_node, copy, bucket))
+            .or_default() += 1;
+    }
+}
+
+/// Record one run of `missing_frames` consecutive sequences from
+/// `origin_node` that a deadline flush released past without emitting. Every
+/// released hole is counted here exactly once, so released holes minus late
+/// fills is the audio no copy recovered.
+pub(crate) fn record_released_run(origin_node: NodeIdentifier, missing_frames: u64) {
+    if missing_frames == 0 {
+        return;
+    }
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.released_holes.entry(origin_node).or_default() += missing_frames;
+    *metrics
+        .released_gap_runs
+        .entry((origin_node, bucket(&COUNT_BUCKETS, missing_frames)))
         .or_default() += 1;
 }
 
 /// Classify one reconstructed frame by the reorder results its push produced.
-pub(crate) fn record_fec_recovery(results: &[ReorderResultCount]) {
+pub(crate) fn record_fec_recovery(origin_node: NodeIdentifier, results: &[ReorderResultCount]) {
     let has = |wanted: VoiceReceiveResult| results.iter().any(|r| r.result() == wanted);
-    let outcome = if has(VoiceReceiveResult::FecLate) {
+    let outcome = if results
+        .iter()
+        .any(|r| matches!(r.result(), VoiceReceiveResult::LateFill { .. }))
+    {
+        // A reconstruction that filled a released hole is late even when a
+        // later copy of it would have been the one to fill; a reconstruction
+        // that lost the race to a filling copy is Discarded below.
         FecRecoveryOutcome::Late
     } else if has(VoiceReceiveResult::InOrder) || has(VoiceReceiveResult::GapBuffered) {
         FecRecoveryOutcome::InTime
@@ -549,7 +596,10 @@ pub(crate) fn record_fec_recovery(results: &[ReorderResultCount]) {
         FecRecoveryOutcome::Discarded
     };
     let mut metrics = METRICS.lock().unwrap();
-    *metrics.fec_recoveries.entry(outcome).or_default() += 1;
+    *metrics
+        .fec_recoveries
+        .entry((origin_node, outcome))
+        .or_default() += 1;
 }
 
 pub(crate) fn set_reorder_pending(source: NodeIdentifier, pending: usize) {
@@ -700,6 +750,9 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             labels.push(("reason".to_owned(), reason.label().to_owned()));
             labels.push(("copy".to_owned(), copy.label().to_owned()));
         }
+        if let VoiceReceiveResult::LateFill { copy } = key.result {
+            labels.push(("copy".to_owned(), copy.label().to_owned()));
+        }
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_receive_events_total",
             labels,
@@ -784,12 +837,41 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             *count as f64,
         ));
     }
-    for ((copy, bucket), count) in &metrics.late_arrivals {
+    for ((origin_node, copy, bucket), count) in &metrics.late_arrivals {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
             vec![
+                ("origin_node".to_owned(), origin_node.to_string()),
                 ("copy".to_owned(), copy.label().to_owned()),
                 ("bucket".to_owned(), (*bucket).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((origin_node, copy, bucket), count) in &metrics.released_hole_first_copies {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_released_hole_first_copy_bucket_total",
+            vec![
+                ("origin_node".to_owned(), origin_node.to_string()),
+                ("copy".to_owned(), copy.label().to_owned()),
+                ("bucket".to_owned(), (*bucket).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for (origin_node, count) in &metrics.released_holes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_released_holes_total",
+            vec![("origin_node".to_owned(), origin_node.to_string())],
+            *count as f64,
+        ));
+    }
+    for ((origin_node, missing_frames), count) in &metrics.released_gap_runs {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_released_gap_runs_total",
+            vec![
+                ("origin_node".to_owned(), origin_node.to_string()),
+                ("missing_frames".to_owned(), (*missing_frames).to_owned()),
             ],
             *count as f64,
         ));
@@ -843,10 +925,13 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             *count as f64,
         ));
     }
-    for (outcome, count) in &metrics.fec_recoveries {
+    for ((origin_node, outcome), count) in &metrics.fec_recoveries {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_fec_recovered_frames_total",
-            vec![("outcome".to_owned(), outcome.label().to_owned())],
+            vec![
+                ("origin_node".to_owned(), origin_node.to_string()),
+                ("outcome".to_owned(), outcome.label().to_owned()),
+            ],
             *count as f64,
         ));
     }
@@ -1232,28 +1317,84 @@ mod tests {
     }
 
     #[test]
-    fn late_arrivals_are_bucketed_by_copy_and_delay_after_release() {
-        let count = |copy: &str, bucket: &str| {
+    fn late_arrivals_are_bucketed_by_origin_copy_and_delay_after_release() {
+        let count = |name: &str, copy: &str, bucket: &str| {
             find_sample(
-                "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
-                &[("copy", copy), ("bucket", bucket)],
+                name,
+                &[("origin_node", "4093"), ("copy", copy), ("bucket", bucket)],
             )
             .map_or(0.0, |sample| sample.value())
         };
-        let before_10 = count("original", "le_10");
-        let before_80 = count("fec", "le_80");
-        let before_gt = count("proactive", "gt_640");
-        record_late_arrival(VoiceCopyKind::Original, Duration::from_millis(10));
-        record_late_arrival(VoiceCopyKind::Fec, Duration::from_millis(41));
-        record_late_arrival(VoiceCopyKind::Proactive, Duration::from_millis(641));
-        assert!(count("original", "le_10") >= before_10 + 1.0);
-        assert!(count("fec", "le_80") >= before_80 + 1.0);
-        assert!(count("proactive", "gt_640") >= before_gt + 1.0);
+        let late = "shitspeak_s2s_voice_late_arrival_after_release_bucket_total";
+        let first = "shitspeak_s2s_voice_released_hole_first_copy_bucket_total";
+        let before_10 = count(late, "original", "le_10");
+        let before_80 = count(late, "fec", "le_80");
+        let before_gt = count(late, "proactive", "gt_640");
+        let before_first_10 = count(first, "original", "le_10");
+        let before_first_80 = count(first, "fec", "le_80");
+        record_late_arrival(
+            4093,
+            VoiceCopyKind::Original,
+            Duration::from_millis(10),
+            true,
+        );
+        record_late_arrival(4093, VoiceCopyKind::Fec, Duration::from_millis(41), false);
+        record_late_arrival(
+            4093,
+            VoiceCopyKind::Proactive,
+            Duration::from_millis(641),
+            true,
+        );
+        assert!(count(late, "original", "le_10") >= before_10 + 1.0);
+        assert!(count(late, "fec", "le_80") >= before_80 + 1.0);
+        assert!(count(late, "proactive", "gt_640") >= before_gt + 1.0);
+        // Only the first copy of a hole lands in the per-hole histogram.
+        assert!(count(first, "original", "le_10") >= before_first_10 + 1.0);
+        assert_eq!(count(first, "fec", "le_80"), before_first_80);
+        for name in [late, first] {
+            let sample = find_sample(
+                name,
+                &[
+                    ("origin_node", "4093"),
+                    ("copy", "original"),
+                    ("bucket", "le_10"),
+                ],
+            )
+            .expect("late arrival sample");
+            assert_no_unbounded_voice_labels(&sample);
+        }
+    }
+
+    #[test]
+    fn released_runs_count_every_hole_once_and_bucket_the_run() {
+        let holes = || {
+            find_sample(
+                "shitspeak_s2s_voice_released_holes_total",
+                &[("origin_node", "4091")],
+            )
+            .map_or(0.0, |sample| sample.value())
+        };
+        let runs = |missing_frames: &str| {
+            find_sample(
+                "shitspeak_s2s_voice_released_gap_runs_total",
+                &[("origin_node", "4091"), ("missing_frames", missing_frames)],
+            )
+            .map_or(0.0, |sample| sample.value())
+        };
+        let before_holes = holes();
+        let before_single = runs("1");
+        let before_short = runs("2_4");
+        record_released_run(4091, 1);
+        record_released_run(4091, 3);
+        record_released_run(4091, 0);
+        assert!(holes() >= before_holes + 4.0);
+        assert!(runs("1") >= before_single + 1.0);
+        assert!(runs("2_4") >= before_short + 1.0);
         let sample = find_sample(
-            "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
-            &[("copy", "original"), ("bucket", "le_10")],
+            "shitspeak_s2s_voice_released_gap_runs_total",
+            &[("origin_node", "4091"), ("missing_frames", "1")],
         )
-        .expect("late arrival sample");
+        .expect("released run sample");
         assert_no_unbounded_voice_labels(&sample);
     }
 

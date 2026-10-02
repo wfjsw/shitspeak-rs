@@ -162,8 +162,23 @@ message VoiceFrame {
   repeated uint64 fec_member_seqs = 11;
   // Bit `i` set when member `i` of the block was an utterance terminator, so
   // a reconstruction can restore the flag.
+  //
+  // Index 64 + s is a sliding-window parity equation instead, sent only to
+  // receivers advertising `VoiceCapabilities.fec_sliding_v1`: one equation over
+  // the `fec_member_seqs` window, sent with its newest member (s = 0) or as
+  // step s of the paced tail after a terminator. Its coefficient for member
+  // seq m is 1 / ((128 + id mod 127) ^ (m mod 128)) with
+  // id = newest_member_seq * 16 + s, over the same field and member symbols.
+  // Overlapping equations are solved jointly.
   uint32 fec_terminator_mask = 12;
   uint32 fec_parity_index    = 13;
+}
+
+// Voice features a node advertises in its upper-layer capability envelope,
+// under the voice service tag. Absent means none of them.
+message VoiceCapabilities {
+  // Receives and solves sliding-window FEC parity (fec_parity_index 64..80).
+  bool fec_sliding_v1 = 1;
 }
 
 // Best-effort request for the origin node to replay recently-sent voice

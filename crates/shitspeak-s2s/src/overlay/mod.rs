@@ -2782,7 +2782,7 @@ mod tests {
                 .alternate_next_hop(),
             None
         );
-        let voice = crate::application::voice::send::OverlayVoiceTransport { overlay: network };
+        let voice = crate::application::voice::send::OverlayVoiceTransport::new(network);
         let quality =
             crate::application::voice::send::VoiceTransport::voice_repair_route_quality(&voice, 10)
                 .unwrap();

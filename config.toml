@@ -411,6 +411,18 @@ adaptive_jitter_decay_step_ms = 10
 reorder_idle_reset_ms = 2000
 reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
+# How long after a deadline flush released past a missing sequence the earliest
+# surviving copy of it may still emit, out of order (0 through 200). Whichever
+# copy kind arrives first fills the hole; 0 disables late fills. A default
+# Mumble client plays a 10 ms margin on top of a delay it adapts to the jitter
+# it observes, so a fill lands in time on a clean edge only within ~10 ms of
+# the release, and somewhat later on a jittery one.
+voice_late_fill_window_ms = 40
+# Toward recipients that all advertise it, every voice frame is followed by one
+# sliding-window FEC parity over the last this-many frames, recoverable before
+# the reorder releases past a loss (0, or 2 through 16; 0 stops sending and
+# advertising it and keeps block FEC only).
+voice_fec_sliding_window = 4
 # Proactive alternate-copy demand starts at these loss/jitter thresholds and
 # reaches the configured copy budget at repair_full_dup_loss_ppm.
 repair_loss_start_ppm = 10000

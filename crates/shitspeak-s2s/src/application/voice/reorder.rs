@@ -40,12 +40,6 @@ const ADAPTIVE_JITTER_DECAY_HOLDOFF_SAMPLES: u32 = 16;
 const DEFAULT_MAX_USERS: u64 = 5_000;
 const MIN_TRACKED_SPEAKERS: usize = 1_024;
 const MAX_TRACKED_SPEAKERS: usize = 16_384;
-/// How long after the reorder released past a missing sequence a FEC
-/// reconstruction of it may still be emitted out of order. Listeners
-/// re-sequence voice by the Mumble packet sequence in their jitter buffer and
-/// discard what arrives past their playout point, so a late fill costs no
-/// audio stall; beyond this age no listener buffer still holds the slot.
-const FEC_LATE_EMIT_WINDOW: Duration = Duration::from_millis(200);
 /// Released holes remembered per speaker, bounding a flush across a large
 /// sequence jump.
 const MAX_RELEASED_HOLES: usize = 64;
@@ -167,11 +161,17 @@ pub(crate) struct FlushByPeer {
 /// A copy of a sequence that arrived after the reorder had released past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LateArrival {
+    sender_session: u32,
     copy_kind: VoiceCopyKind,
     after_release: Duration,
+    first: bool,
 }
 
 impl LateArrival {
+    pub(crate) fn sender_session(self) -> u32 {
+        self.sender_session
+    }
+
     pub(crate) fn copy_kind(self) -> VoiceCopyKind {
         self.copy_kind
     }
@@ -181,6 +181,39 @@ impl LateArrival {
     pub(crate) fn after_release(self) -> Duration {
         self.after_release
     }
+
+    /// Whether this is the first copy of any kind to reach the hole: the
+    /// earliest any listener could have had the frame.
+    pub(crate) fn first(self) -> bool {
+        self.first
+    }
+}
+
+/// A run of consecutive sequences one deadline flush released past without
+/// emitting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReleasedRun {
+    sender_session: u32,
+    missing_frames: u64,
+}
+
+impl ReleasedRun {
+    pub(crate) fn sender_session(self) -> u32 {
+        self.sender_session
+    }
+
+    pub(crate) fn missing_frames(self) -> u64 {
+        self.missing_frames
+    }
+}
+
+/// A sequence a deadline flush released past without emitting it.
+#[derive(Debug, Clone, Copy)]
+struct ReleasedHole {
+    seq: u64,
+    released_at: Instant,
+    /// Whether any copy of it has arrived since the release.
+    seen: bool,
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +224,7 @@ pub(crate) struct ReorderReport {
     opened_gap: Option<GapReport>,
     flushes_by_peer: Vec<FlushByPeer>,
     late_arrivals: Vec<LateArrival>,
+    released_runs: Vec<ReleasedRun>,
 }
 
 impl ReorderReport {
@@ -207,6 +241,7 @@ impl ReorderReport {
             opened_gap,
             flushes_by_peer: Vec::new(),
             late_arrivals: Vec::new(),
+            released_runs: Vec::new(),
         }
     }
 
@@ -223,6 +258,11 @@ impl ReorderReport {
     /// Copies that arrived for sequences already released past.
     pub(crate) fn late_arrivals(&self) -> &[LateArrival] {
         &self.late_arrivals
+    }
+
+    /// Runs of sequences deadline flushes released past without emitting.
+    pub(crate) fn released_runs(&self) -> &[ReleasedRun] {
+        &self.released_runs
     }
 
     pub(crate) fn pending_total(&self) -> usize {
@@ -256,6 +296,7 @@ impl ReorderReport {
             opened_gap: None,
             flushes_by_peer: Vec::new(),
             late_arrivals: Vec::new(),
+            released_runs: Vec::new(),
         }
     }
 
@@ -272,6 +313,7 @@ impl ReorderReport {
         }
         self.flushes_by_peer.extend(other.flushes_by_peer);
         self.late_arrivals.extend(other.late_arrivals);
+        self.released_runs.extend(other.released_runs);
         self
     }
 }
@@ -406,9 +448,9 @@ struct SenderState {
     /// Delivery cadence survives an empty buffer until the speaker is pruned.
     next_flush_at: Option<Instant>,
     /// Sequences a deadline flush released past without ever emitting, with
-    /// the release time. A FEC reconstruction of one may still emit late,
-    /// once, within [`FEC_LATE_EMIT_WINDOW`].
-    released_holes: VecDeque<(u64, Instant)>,
+    /// the release time. The earliest surviving copy of one may still emit
+    /// late, once, within the configured late-fill window.
+    released_holes: VecDeque<ReleasedHole>,
     /// The last [`DELIVERY_HISTORY`] delivered sequences and which kind of
     /// copy delivered each.
     delivered: VecDeque<(u64, VoiceCopyKind)>,
@@ -428,12 +470,16 @@ impl SenderState {
         }
     }
 
-    /// When a flush released past `seq` without emitting it, if it did.
-    fn released_at(&self, seq: u64) -> Option<Instant> {
-        self.released_holes
-            .iter()
-            .find(|(hole, _)| *hole == seq)
-            .map(|(_, released_at)| *released_at)
+    /// When a flush released past `seq` without emitting it, if it did, and
+    /// whether this is the first copy to arrive since. Marks the hole seen.
+    fn observe_released(&mut self, seq: u64) -> Option<(Instant, bool)> {
+        let hole = self
+            .released_holes
+            .iter_mut()
+            .find(|hole| hole.seq == seq)?;
+        let first = !hole.seen;
+        hole.seen = true;
+        Some((hole.released_at, first))
     }
 
     /// Why a sequence below the delivery cursor is being rejected.
@@ -446,7 +492,7 @@ impl SenderState {
         {
             return DuplicateReason::AlreadyDelivered(*copy);
         }
-        if self.released_holes.iter().any(|(hole, _)| *hole == seq) {
+        if self.released_holes.iter().any(|hole| hole.seq == seq) {
             return DuplicateReason::LateAfterRelease;
         }
         DuplicateReason::Untracked
@@ -466,10 +512,9 @@ impl Reorderer {
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let histogram_bucket_ms = cfg.adaptive_jitter_histogram_bucket_ms.max(1);
-        let histogram_bucket_count = ((cfg.adaptive_jitter_max_delay_ms / histogram_bucket_ms)
-            as usize
-            + 1)
-            .clamp(MIN_HISTOGRAM_BUCKETS, MAX_HISTOGRAM_BUCKETS);
+        let histogram_bucket_count =
+            ((cfg.adaptive_jitter_max_delay_ms / histogram_bucket_ms) as usize + 1)
+                .clamp(MIN_HISTOGRAM_BUCKETS, MAX_HISTOGRAM_BUCKETS);
         Arc::new(Self {
             cfg,
             max_users,
@@ -1010,38 +1055,44 @@ impl Reorderer {
             .gap_hold_deadline(&entry)
             .is_some_and(|deadline| deadline <= now)
         {
-            let drained = self.flush_pending(&mut entry, now, &mut report);
+            let drained = self.flush_pending(session, &mut entry, now, &mut report);
             state.total_pending = state.total_pending.saturating_sub(drained);
         }
 
         // Once a stream has advanced, every lower same-epoch sequence is a
         // duplicate or late arrival. Rewinding here re-emits audio and breaks
-        // the receiver's monotonic stream contract. The one exception is a FEC
-        // reconstruction of a hole a flush released past without emitting:
-        // it has never been played, so it emits once, out of order, and
-        // leaves the delivery cadence untouched.
+        // the receiver's monotonic stream contract. The one exception is the
+        // earliest copy of a hole a flush released past without emitting: it
+        // has never been played, so it emits once, out of order, within the
+        // late-fill window, and leaves the delivery cadence untouched. Which
+        // copy kind wins that race is up to the network, not the policy: a
+        // copy that lands at +10 ms still fits a default client's 10 ms
+        // margin, while one that lands at +80 ms fits only a client whose
+        // learned jitter delay has grown that deep.
         if frame_seq < entry.next_seq {
-            let released_at = entry.released_at(frame_seq);
-            if let Some(released_at) = released_at {
+            let released = entry.observe_released(frame_seq);
+            if let Some((released_at, first)) = released {
                 report.late_arrivals.push(LateArrival {
+                    sender_session: session,
                     copy_kind,
                     after_release: now.saturating_duration_since(released_at),
+                    first,
                 });
             }
-            let late_fill = copy_kind == VoiceCopyKind::Fec
-                && !frame.is_terminator
-                && released_at.is_some_and(|released_at| {
-                    now.saturating_duration_since(released_at) < FEC_LATE_EMIT_WINDOW
+            let late_fill = !frame.is_terminator
+                && released.is_some_and(|(released_at, _)| {
+                    now.saturating_duration_since(released_at) < self.late_fill_window()
                 });
             if !late_fill {
                 let reason = entry.below_cursor_reason(frame_seq);
                 report.results.push(rejected(reason, copy_kind));
                 return self.finish_push(&mut state, session, entry, report, now);
             }
-            entry.released_holes.retain(|(hole, _)| *hole != frame_seq);
-            report
-                .results
-                .push(ReorderResultCount::new(VoiceReceiveResult::FecLate, 1));
+            entry.released_holes.retain(|hole| hole.seq != frame_seq);
+            report.results.push(ReorderResultCount::new(
+                VoiceReceiveResult::LateFill { copy: copy_kind },
+                1,
+            ));
             let emission = ReorderEmission::new(from, frame, copy_kind);
             entry.record_delivered(std::slice::from_ref(&emission));
             let mut report = self.finish_push(&mut state, session, entry, report, now);
@@ -1254,6 +1305,16 @@ impl Reorderer {
         duration * 9 / 10
     }
 
+    /// How long after the reorder released past a missing sequence the earliest
+    /// surviving copy of it may still emit, out of order. Listeners re-sequence
+    /// voice by the Mumble packet sequence in their jitter buffer and discard
+    /// what arrives past their playout point, so a late fill costs no audio
+    /// stall; beyond this age no listener buffer still holds the slot. A window
+    /// of 0 disables late fills.
+    fn late_fill_window(&self) -> Duration {
+        Duration::from_millis(self.cfg.voice_late_fill_window_ms)
+    }
+
     fn finish_push(
         &self,
         state: &mut ReorderInner,
@@ -1289,7 +1350,7 @@ impl Reorderer {
                 .gap_hold_deadline(&entry)
                 .is_some_and(|expiry| expiry <= now)
             {
-                let drained = self.flush_pending(&mut entry, now, &mut report);
+                let drained = self.flush_pending(session, &mut entry, now, &mut report);
                 state.total_pending = state.total_pending.saturating_sub(drained);
                 report.opened_gap = None;
             }
@@ -1302,6 +1363,7 @@ impl Reorderer {
 
     fn flush_pending(
         &self,
+        session: u32,
         entry: &mut SenderState,
         now: Instant,
         report: &mut ReorderReport,
@@ -1316,12 +1378,30 @@ impl Reorderer {
         entry.hold_started_at = None;
         entry.gap_expires_at = None;
         if let Some((&last_seq, _)) = pending.last_key_value() {
+            // Every missing run is reported in full, even past the bounded
+            // per-hole memory below, so released holes are counted exactly
+            // once however far the flush jumps.
+            let mut expected = entry.next_seq;
+            for &seq in pending.keys() {
+                let missing_frames = seq.saturating_sub(expected);
+                if missing_frames > 0 {
+                    report.released_runs.push(ReleasedRun {
+                        sender_session: session,
+                        missing_frames,
+                    });
+                }
+                expected = seq.saturating_add(1);
+            }
             let first_hole = entry
                 .next_seq
                 .max(last_seq.saturating_sub(MAX_RELEASED_HOLES as u64));
             for seq in first_hole..last_seq {
                 if !pending.contains_key(&seq) {
-                    entry.released_holes.push_back((seq, now));
+                    entry.released_holes.push_back(ReleasedHole {
+                        seq,
+                        released_at: now,
+                        seen: false,
+                    });
                 }
             }
             while entry.released_holes.len() > MAX_RELEASED_HOLES {
@@ -1416,7 +1496,7 @@ impl Reorderer {
 
                 let entry = state.per_sender.get_mut(&session).unwrap();
                 let emitted_before = report.emissions.len();
-                let drained = self.flush_pending(entry, now, &mut report);
+                let drained = self.flush_pending(session, entry, now, &mut report);
                 entry.record_delivered(&report.emissions[emitted_before..]);
                 state.total_pending = state.total_pending.saturating_sub(drained);
             }
@@ -1438,7 +1518,7 @@ impl Reorderer {
     /// Whether a FEC reconstruction of `seq` would fill a hole the reorder is
     /// waiting on: a sequence behind an already buffered later frame, the next
     /// sequence once its delivery is overdue, or a hole a flush released past
-    /// within [`FEC_LATE_EMIT_WINDOW`]. The next sequence is not wanted before
+    /// within the late-fill window. The next sequence is not wanted before
     /// it is due: its original may be in flight on a slower path than the
     /// parity took, and emitting reconstructions early mixes two path
     /// latencies into one stream — jitter the listener hears. A sequence past
@@ -1475,8 +1555,9 @@ impl Reorderer {
                 seq == entry.next_seq && entry.next_flush_at.is_some_and(|due| due <= now);
             return behind_buffered || overdue;
         }
-        entry.released_holes.iter().any(|(hole, released_at)| {
-            *hole == seq && now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
+        entry.released_holes.iter().any(|hole| {
+            hole.seq == seq
+                && now.saturating_duration_since(hole.released_at) < self.late_fill_window()
         })
     }
 
@@ -1760,6 +1841,8 @@ mod tests {
         );
         assert_eq!(r.next_deadline(), Some(at(18)));
         // Expiry on an ingress call must flush before considering late repair.
+        // The repair of 3 lands in the same call that releases past it, so it
+        // late-fills that hole out of order behind the flushed 4.
         let expired = r.push_at(
             12,
             timed_frame(1, 3, 8),
@@ -1774,7 +1857,7 @@ mod tests {
                 .iter()
                 .map(|(_, f)| f.s2s_seq)
                 .collect::<Vec<_>>(),
-            vec![4]
+            vec![4, 3]
         );
         assert_eq!(r.pending_total(), 0);
     }
@@ -2018,29 +2101,30 @@ mod tests {
             vec![(DuplicateReason::AlreadyBuffered, Proactive)]
         );
         // 4 arrives past the 108 ms cadence: the reorder releases past 1 and
-        // 2. An original of 1 is then genuinely late.
+        // 2. FEC fills 2 inside the late-fill window; its original arriving
+        // afterwards lost the race to FEC — the case that used to hide in one
+        // `duplicate_or_late`.
         assert!(rejected_as(push(1, 4, Original, 200)).is_empty());
-        assert_eq!(
-            rejected_as(push(1, 1, Original, 210)),
-            vec![(DuplicateReason::LateAfterRelease, Original)]
-        );
-        // FEC late-fills 2; its original arriving afterwards lost the race
-        // to FEC — the case that used to hide in one `duplicate_or_late`.
         let late = push(1, 2, Fec, 220);
         assert!(
             late.iter()
-                .any(|c| c.result() == VoiceReceiveResult::FecLate)
+                .any(|c| c.result() == VoiceReceiveResult::LateFill { copy: Fec })
         );
         assert_eq!(
             rejected_as(push(1, 2, Original, 230)),
             vec![(DuplicateReason::AlreadyDelivered(Fec), Original)]
         );
+        // An original of 1 past the late-fill window is genuinely late.
+        assert_eq!(
+            rejected_as(push(1, 1, Original, 250)),
+            vec![(DuplicateReason::LateAfterRelease, Original)]
+        );
         // Far beyond the delivery history nothing is known.
         for seq in 5..(5 + DELIVERY_HISTORY as u64) {
-            push(1, seq, Original, 240);
+            push(1, seq, Original, 260);
         }
         assert_eq!(
-            rejected_as(push(1, 3, Original, 250)),
+            rejected_as(push(1, 3, Original, 270)),
             vec![(DuplicateReason::Untracked, Original)]
         );
     }
@@ -2066,16 +2150,16 @@ mod tests {
         assert!(r.fec_wants(0xABC, 1, 1));
         assert!(!r.fec_wants(0xABC, 2, 1), "never for another epoch");
 
-        // Only a FEC reconstruction may fill the released hole.
-        assert!(seqs(push(1, false, VoiceCopyKind::Proactive, 210)).is_empty());
-        let late = push(1, false, VoiceCopyKind::Fec, 220);
-        assert!(
-            late.result_counts()
-                .iter()
-                .any(|r| r.result() == VoiceReceiveResult::FecLate)
-        );
+        // A FEC reconstruction may fill the released hole within the window.
+        let late = push(1, false, VoiceCopyKind::Fec, 210);
+        assert!(late.result_counts().iter().any(|r| r.result()
+            == VoiceReceiveResult::LateFill {
+                copy: VoiceCopyKind::Fec
+            }));
         assert_eq!(seqs(late), vec![1]);
         assert!(!r.fec_wants(0xABC, 1, 1));
+        // Once filled, no later copy of it fills again.
+        assert!(seqs(push(1, false, VoiceCopyKind::Proactive, 220)).is_empty());
         assert!(seqs(push(1, false, VoiceCopyKind::Fec, 230)).is_empty());
         // The late fill did not move the stream: 3 is next and emits in order.
         assert_eq!(seqs(push(3, false, VoiceCopyKind::Original, 240)), vec![3]);
@@ -2085,6 +2169,96 @@ mod tests {
         assert_eq!(seqs(push(6, false, VoiceCopyKind::Original, 600)), vec![6]);
         assert!(seqs(push(4, true, VoiceCopyKind::Fec, 610)).is_empty());
         assert!(seqs(push(5, false, VoiceCopyKind::Fec, 801)).is_empty());
+    }
+
+    #[test]
+    fn earliest_copy_of_a_released_hole_fills_it_whatever_its_kind() {
+        use VoiceCopyKind::{Fec, Original, Proactive};
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let seqs = |report: ReorderReport| -> Vec<u64> {
+            report
+                .into_emissions()
+                .iter()
+                .map(|(_, f)| f.s2s_seq)
+                .collect()
+        };
+        let rejected_as = |report: ReorderReport| -> Vec<(DuplicateReason, VoiceCopyKind)> {
+            report
+                .result_counts()
+                .iter()
+                .filter_map(|count| match count.result() {
+                    VoiceReceiveResult::DuplicateOrLate { reason, copy } => Some((reason, copy)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let push = |seq: u64, kind: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, 1, seq, false), None, kind, at(ms))
+        };
+        assert_eq!(seqs(push(0, Original, 0)), vec![0]);
+        // Frame 2 arrives past the 108 ms cadence: the reorder releases past 1.
+        assert_eq!(seqs(push(2, Original, 200)), vec![2]);
+
+        // The original is the earliest copy of the released hole — and the one
+        // that can still reach a listener. It fills the hole, out of order,
+        // instead of being discarded while a later reconstruction is awaited.
+        assert_eq!(
+            seqs(push(1, Original, 210)),
+            vec![1],
+            "the earliest copy of a released hole fills it"
+        );
+        assert_eq!(
+            rejected_as(push(1, Fec, 225)),
+            vec![(DuplicateReason::AlreadyDelivered(Original), Fec)],
+            "a later copy of a filled hole is a duplicate"
+        );
+        // The fill did not move the stream: 3 emits in order.
+        assert_eq!(seqs(push(3, Original, 240)), vec![3]);
+
+        // A proactive copy fills the next released hole on the same terms.
+        assert_eq!(seqs(push(6, Original, 400)), vec![6]);
+        assert_eq!(
+            seqs(push(4, Proactive, 420)),
+            vec![4],
+            "a proactive copy may fill too"
+        );
+        assert_eq!(seqs(push(5, Original, 430)), vec![5]);
+    }
+
+    #[test]
+    fn a_copy_past_the_late_fill_window_never_fills_a_released_hole() {
+        use VoiceCopyKind::{Original, Proactive};
+        let mut cfg = cfg();
+        cfg.voice_late_fill_window_ms = 40;
+        let r = Reorderer::new(cfg);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let seqs = |report: ReorderReport| -> Vec<u64> {
+            report
+                .into_emissions()
+                .iter()
+                .map(|(_, f)| f.s2s_seq)
+                .collect()
+        };
+        let push = |seq: u64, kind: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, 1, seq, false), None, kind, at(ms))
+        };
+        assert_eq!(seqs(push(0, Original, 0)), vec![0]);
+        // Frame 2 arrives past the 108 ms cadence: the reorder releases past 1
+        // at 200.
+        assert_eq!(seqs(push(2, Original, 200)), vec![2]);
+        assert_eq!(seqs(push(1, Original, 230)), vec![1], "inside the window");
+
+        // Holes 3 and 4 release at 700. One copy is inside the window, the
+        // other outside: only the inside one fills.
+        assert_eq!(seqs(push(6, Proactive, 700)), vec![6]);
+        assert_eq!(seqs(push(3, Original, 730)), vec![3], "inside the window");
+        assert!(
+            seqs(push(4, Original, 800)).is_empty(),
+            "past the window the listener's slot is gone"
+        );
     }
 
     #[test]
@@ -2106,15 +2280,19 @@ mod tests {
         assert!(late(&push(0, Original, 0)).is_empty());
         // Frame 2 arrives past the cadence: the reorder releases past 1 at 200.
         assert!(late(&push(2, Original, 200)).is_empty());
+        // The earliest copy of the released hole fills it and is still
+        // measured for how late it came.
         assert_eq!(late(&push(1, Proactive, 230)), vec![(Proactive, 30)]);
-        assert_eq!(late(&push(1, Fec, 260)), vec![(Fec, 60)]);
+        // A later copy of a filled hole is a duplicate: the hole is gone, so
+        // there is nothing left for it to be late for.
+        assert!(late(&push(1, Fec, 260)).is_empty());
         // In-order and already-delivered frames are not late arrivals.
         assert!(late(&push(3, Original, 270)).is_empty());
         assert!(late(&push(1, Original, 280)).is_empty());
 
-        // Holes 4 and 5 release at 700. A reconstruction of 5 too late to fill
-        // it is measured, and must not forget hole 4: its original, well past
-        // the FEC window, is still measured too.
+        // Holes 4 and 5 release at 700. Copies past the late-fill window are
+        // rejected but still measured — and a second copy of an unfilled hole
+        // is measured again.
         assert!(late(&push(6, Original, 700)).is_empty());
         assert_eq!(late(&push(5, Fec, 950)), vec![(Fec, 250)]);
         let very_late = push(4, Original, 1_300);
@@ -2124,6 +2302,80 @@ mod tests {
                 reason: DuplicateReason::LateAfterRelease,
                 copy: Original,
             }));
+        assert_eq!(late(&push(4, Fec, 1_400)), vec![(Fec, 700)]);
+    }
+
+    #[test]
+    fn released_holes_are_counted_once_per_run_and_first_copy_once_per_hole() {
+        use VoiceCopyKind::{Fec, Original};
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let push = |seq: u64, kind: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, 1, seq, false), None, kind, at(ms))
+        };
+        let runs = |report: &ReorderReport| -> Vec<(u32, u64)> {
+            report
+                .released_runs()
+                .iter()
+                .map(|run| (run.sender_session(), run.missing_frames()))
+                .collect()
+        };
+        let firsts = |report: &ReorderReport| -> Vec<(u32, VoiceCopyKind, bool)> {
+            report
+                .late_arrivals()
+                .iter()
+                .map(|late| (late.sender_session(), late.copy_kind(), late.first()))
+                .collect()
+        };
+        assert!(runs(&push(0, Original, 0)).is_empty());
+        // 3 arrives past the 108 ms cadence: one run of two holes, 1 and 2.
+        assert_eq!(runs(&push(3, Original, 200)), vec![(0xABC, 2)]);
+        // Each hole's first copy is marked first, whichever kind it is and
+        // whether or not it fills.
+        assert_eq!(
+            firsts(&push(1, Original, 210)),
+            vec![(0xABC, Original, true)]
+        );
+        assert_eq!(firsts(&push(2, Fec, 215)), vec![(0xABC, Fec, true)]);
+        // A filled hole is gone: its later copies are plain duplicates.
+        assert!(firsts(&push(2, Original, 220)).is_empty());
+        // 5 arrives past the next cadence: one run of one hole, 4.
+        assert_eq!(runs(&push(5, Original, 400)), vec![(0xABC, 1)]);
+        // Past the window the copy is rejected, still first; the next is not.
+        assert_eq!(
+            firsts(&push(4, Original, 500)),
+            vec![(0xABC, Original, true)]
+        );
+        assert_eq!(firsts(&push(4, Fec, 510)), vec![(0xABC, Fec, false)]);
+        // In-order delivery releases nothing.
+        assert!(runs(&push(6, Original, 520)).is_empty());
+    }
+
+    #[test]
+    fn a_deadline_drain_reports_the_runs_it_releases() {
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let push = |seq: u64| {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                start,
+            )
+        };
+        push(0);
+        assert!(push(2).released_runs().is_empty());
+        let drained = r.drain_expired_at(start + Duration::from_millis(108));
+        assert_eq!(
+            drained
+                .released_runs()
+                .iter()
+                .map(|run| (run.sender_session(), run.missing_frames()))
+                .collect::<Vec<_>>(),
+            vec![(0xABC, 1)]
+        );
     }
 
     #[test]
@@ -2409,12 +2661,16 @@ mod tests {
         let drained = r.drain_expired();
         let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
         assert_eq!(seqs, vec![2, 4]);
-        // After the flush the holes are permanently missed: a late repair is
-        // no longer admissible.
+        // The drain released past hole 1 a moment ago, so a repair of it
+        // late-fills the hole out of order. Only a copy past the late-fill
+        // window is still inadmissible.
         let late = r
             .push_with_route_hint_report_with_repair(11, frame(0xABC, 1, 1, false), None, true)
             .into_emissions();
-        assert!(late.is_empty());
+        assert_eq!(
+            late.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![1]
+        );
         assert_eq!(r.held_state().0, 0);
     }
 
@@ -2473,13 +2729,13 @@ mod tests {
     }
 
     #[test]
-    fn expired_gap_rejects_reactive_repair_before_the_deadline_task_drains() {
+    fn expired_gap_flushes_on_ingress_before_the_deadline_task_drains() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 5;
         // Tiny hold budget: the whole chunk-hold window exhausts while the
-        // test sleeps, so the gap is permanently missed before the repair.
+        // test sleeps, so the gap is released before the repair.
         c.chunk_hold_budget_ms = 2;
         let r = Reorderer::new(c);
 
@@ -2487,6 +2743,10 @@ mod tests {
         r.push(11, frame(0xABC, 1, 2, false));
         std::thread::sleep(Duration::from_millis(10));
 
+        // The ingress call flushes the expired chunk before considering the
+        // repair. The repair lands in that same call, so it late-fills the
+        // hole the flush just released, out of order behind the flushed 2 —
+        // and nothing is left for the deadline task to drain.
         let repair = r
             .push_with_route_hint_report_with_copy_kind(
                 11,
@@ -2497,7 +2757,7 @@ mod tests {
             .into_marked_emissions();
         assert_eq!(
             repair.iter().map(|e| e.frame().s2s_seq).collect::<Vec<_>>(),
-            vec![2]
+            vec![2, 1]
         );
         assert_eq!(
             r.drain_expired()
@@ -3129,16 +3389,19 @@ mod tests {
             emits.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
             vec![2]
         );
-        assert!(
-            r.push_at(
+        // Hole 1 released at 108; the repair a millisecond later late-fills it.
+        let filled = r
+            .push_at(
                 11,
                 frame(0xABC, 1, 1, false),
                 None,
                 VoiceCopyKind::ReactiveRepair,
-                start + Duration::from_millis(109)
+                start + Duration::from_millis(109),
             )
-            .into_emissions()
-            .is_empty()
+            .into_emissions();
+        assert_eq!(
+            filled.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![1]
         );
     }
 
@@ -3171,8 +3434,10 @@ mod tests {
             vec![1, 2]
         );
         let expiry = start + Duration::from_millis(108);
-        // An expired repair triggers delivery of the remaining suffix, but
-        // the missing packet itself can no longer join the stream.
+        // An expired repair triggers delivery of the remaining suffix without
+        // extending its deadline. The repair itself lands in the same call
+        // that releases past it, so it late-fills that hole out of order
+        // behind the flushed 4.
         let emitted = r
             .push_at(
                 11,
@@ -3184,7 +3449,7 @@ mod tests {
             .into_emissions();
         assert_eq!(
             emitted.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
-            vec![4]
+            vec![4, 3]
         );
         assert!(r.drain_expired_at(expiry).into_emissions().is_empty());
         assert_eq!(r.pending_total(), 0);

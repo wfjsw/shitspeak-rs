@@ -42,6 +42,19 @@
 //! runs whenever a parity or data frame arrives and recovers the members the
 //! reorder still wants. Recovered frames enter the reorder as
 //! [`crate::application::voice::reorder::VoiceCopyKind::Fec`].
+//!
+//! Sliding-window parity is the low-latency alternative, used toward
+//! receivers that advertise it (see `voice::capability`). Every protectable
+//! data frame is followed at once by one parity equation over the last
+//! `voice_fec_sliding_window` members, so a single loss is solvable the moment
+//! the parity sent with the lost frame arrives — a block code has to wait for
+//! its block to complete first, which can be several frames after the
+//! receiver's reorder released past the hole. Consecutive equations overlap,
+//! so a burst up to the window is solvable jointly from the equations that
+//! cover it. The overhead is one parity frame per data frame, like the
+//! default block shape. Sliding parity travels on wire indices
+//! [`SLIDING_PARITY_INDEX_BASE`] `+ tail_step`, which block-only receivers
+//! already ignore.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
@@ -61,6 +74,11 @@ pub(crate) const MAX_PARITY_FRAMES: usize = 16;
 pub(crate) const MAX_INTERLEAVE_DEPTH: usize = 8;
 /// Wire `fec_parity_index` of Reed-Solomon parity row 0.
 pub(crate) const RS_PARITY_INDEX_BASE: u32 = 2;
+/// Wire `fec_parity_index` of sliding-window parity sent with its newest
+/// member; the paced tail after a terminator adds its step.
+pub(crate) const SLIDING_PARITY_INDEX_BASE: u32 = 64;
+/// Upper bound on members one sliding-window parity covers.
+pub(crate) const MAX_SLIDING_WINDOW: usize = 16;
 /// Spacing of parity rows still owed when an utterance ends, standing in for
 /// the data frames that would otherwise have paced them.
 pub(crate) const TAIL_PARITY_SPACING: Duration = Duration::from_millis(20);
@@ -141,10 +159,17 @@ pub(crate) fn parity_alternate_usable(
 }
 
 /// Minimum receiver mirror length for a sender coding `block_size` members at
-/// `depth` interleaving: two full interleave spans, so a block's members are
-/// still mirrored when its last parity arrives.
-pub(crate) fn receiver_window_for(configured: usize, block_size: usize, depth: usize) -> usize {
-    configured.max(2 * block_size.max(1) * depth.max(1))
+/// `depth` interleaving, or sliding parity over `sliding_window` members: two
+/// full spans, so every member is still mirrored when its last parity arrives.
+pub(crate) fn receiver_window_for(
+    configured: usize,
+    block_size: usize,
+    depth: usize,
+    sliding_window: usize,
+) -> usize {
+    configured
+        .max(2 * block_size.max(1) * depth.max(1))
+        .max(2 * sliding_window.min(MAX_SLIDING_WINDOW))
 }
 
 /// Map a wire parity index to its Reed-Solomon row, or `None` for the retired
@@ -152,6 +177,13 @@ pub(crate) fn receiver_window_for(configured: usize, block_size: usize, depth: u
 pub(crate) fn rs_parity_row(wire_index: u32) -> Option<usize> {
     let row = wire_index.checked_sub(RS_PARITY_INDEX_BASE)? as usize;
     (row < MAX_PARITY_FRAMES).then_some(row)
+}
+
+/// Map a wire parity index to a sliding-window tail step, or `None` outside
+/// the sliding range.
+pub(crate) fn sliding_parity_step(wire_index: u32) -> Option<u32> {
+    let step = wire_index.checked_sub(SLIDING_PARITY_INDEX_BASE)?;
+    (step < MAX_SLIDING_WINDOW as u32).then_some(step)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +254,26 @@ fn mul_acc(dst: &mut [u8], src: &[u8], coefficient: u8) {
 fn coefficient(row: usize, member: usize) -> u8 {
     debug_assert!(row < MAX_PARITY_FRAMES && member < MAX_BLOCK_MEMBERS);
     gf_inv(((MAX_BLOCK_MEMBERS + row) as u8) ^ (member as u8))
+}
+
+/// Identity of one sliding-window parity equation: its newest member and
+/// tail step. Distinct equations near each other get distinct identities.
+fn sliding_parity_id(newest_member: u64, step: u32) -> u64 {
+    newest_member
+        .wrapping_mul(MAX_SLIDING_WINDOW as u64)
+        .wrapping_add(u64::from(step))
+}
+
+/// Cauchy coefficient of member `member_seq` in sliding equation `parity_id`:
+/// `1 / (x + y)` with `x = 128 + parity_id mod 127` and `y = member_seq mod
+/// 128`. The x and y ranges are disjoint, so with distinct x and y every
+/// square submatrix is invertible. A rare collision between equations or
+/// members far apart only costs recovery power: the solver never pins an
+/// unknown the equations do not determine.
+fn sliding_coefficient(parity_id: u64, member_seq: u64) -> u8 {
+    let x = 128 + (parity_id % 127) as u8;
+    let y = (member_seq % 128) as u8;
+    gf_inv(x ^ y)
 }
 
 /// Accumulate `coefficient · symbol(payload)` into `acc`, where the symbol is
@@ -341,22 +393,118 @@ fn encode_block(members: Vec<PendingMember>, parity_frames: usize) -> FecBlockTo
     }
 }
 
-/// One parity frame the sender owes now: row `row` of `block`, to be sent
-/// after `tail_step × TAIL_PARITY_SPACING` (step 0 is immediate).
+/// One sliding-window parity equation ready to be encoded onto the wire.
+#[derive(Debug)]
+pub(crate) struct SlidingParityToSend {
+    member_seqs: Vec<u64>,
+    parity: Bytes,
+    terminator_mask: u32,
+    step: u32,
+}
+
+impl SlidingParityToSend {
+    fn encode(&self, sender_session: u32, sender_epoch: u64) -> Option<Bytes> {
+        let frame = VoiceFrame {
+            sender_session,
+            server_id: String::new(),
+            sender_epoch,
+            s2s_seq: self.member_seqs.last().copied().unwrap_or(0),
+            target_kind: 0,
+            is_terminator: false,
+            payload: self.parity.clone(),
+            intent: None,
+            proactive_copy: false,
+            fec_parity: true,
+            fec_member_seqs: self.member_seqs.clone(),
+            fec_terminator_mask: self.terminator_mask,
+            fec_parity_index: SLIDING_PARITY_INDEX_BASE + self.step,
+        };
+        proto::encode_voice(&frame).ok()
+    }
+}
+
+fn encode_sliding(window: &VecDeque<PendingMember>, step: u32) -> SlidingParityToSend {
+    let member_seqs: Vec<u64> = window.iter().map(|member| member.seq).collect();
+    let parity_id = sliding_parity_id(member_seqs.last().copied().unwrap_or(0), step);
+    let symbol_len = LENGTH_PREFIX
+        + window
+            .iter()
+            .map(|member| member.payload.len())
+            .max()
+            .unwrap_or(0);
+    let mut acc = vec![0u8; symbol_len];
+    let mut terminator_mask = 0u32;
+    for (index, member) in window.iter().enumerate() {
+        mul_acc_symbol(
+            &mut acc,
+            &member.payload,
+            sliding_coefficient(parity_id, member.seq),
+        );
+        if member.terminator {
+            terminator_mask |= 1 << index;
+        }
+    }
+    SlidingParityToSend {
+        member_seqs,
+        parity: Bytes::from(acc),
+        terminator_mask,
+        step,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParitySource {
+    /// Row `row` of a Reed-Solomon block.
+    Block {
+        block: Arc<FecBlockToSend>,
+        row: usize,
+    },
+    Sliding(Arc<SlidingParityToSend>),
+}
+
+/// One parity frame the sender owes now, to be sent after
+/// `tail_step × TAIL_PARITY_SPACING` (step 0 is immediate).
 #[derive(Debug, Clone)]
 pub(crate) struct ParityEmission {
-    pub(crate) block: Arc<FecBlockToSend>,
-    pub(crate) row: usize,
+    source: ParitySource,
     pub(crate) tail_step: u32,
 }
 
 impl ParityEmission {
     pub(crate) fn encode(&self, sender_session: u32, sender_epoch: u64) -> Option<Bytes> {
-        self.block.encode(sender_session, sender_epoch, self.row)
+        match &self.source {
+            ParitySource::Block { block, row } => block.encode(sender_session, sender_epoch, *row),
+            ParitySource::Sliding(parity) => parity.encode(sender_session, sender_epoch),
+        }
     }
 
     pub(crate) fn delay(&self) -> Duration {
         TAIL_PARITY_SPACING * self.tail_step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn member_seqs(&self) -> &[u64] {
+        match &self.source {
+            ParitySource::Block { block, .. } => &block.member_seqs,
+            ParitySource::Sliding(parity) => &parity.member_seqs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminator_mask(&self) -> u32 {
+        match &self.source {
+            ParitySource::Block { block, .. } => block.terminator_mask,
+            ParitySource::Sliding(parity) => parity.terminator_mask,
+        }
+    }
+
+    /// The `fec_parity_index` this emission travels with.
+    #[cfg(test)]
+    pub(crate) fn wire_index(&self) -> u32 {
+        match &self.source {
+            ParitySource::Block { row, .. } => RS_PARITY_INDEX_BASE + *row as u32,
+            ParitySource::Sliding(parity) => SLIDING_PARITY_INDEX_BASE + parity.step,
+        }
     }
 }
 
@@ -373,16 +521,14 @@ struct SenderFecStream {
     lanes: Vec<Vec<PendingMember>>,
     next_lane: usize,
     emitting: Vec<EmittingBlock>,
-    last_used: Instant,
 }
 
 impl SenderFecStream {
-    fn new(depth: usize, now: Instant) -> Self {
+    fn new(depth: usize) -> Self {
         Self {
             lanes: (0..depth).map(|_| Vec::new()).collect(),
             next_lane: 0,
             emitting: Vec::new(),
-            last_used: now,
         }
     }
 
@@ -428,8 +574,10 @@ impl SenderFecStream {
         let mut due = Vec::new();
         for emitting in &mut self.emitting {
             due.push(ParityEmission {
-                block: emitting.block.clone(),
-                row: emitting.next_row,
+                source: ParitySource::Block {
+                    block: emitting.block.clone(),
+                    row: emitting.next_row,
+                },
                 tail_step: 0,
             });
             emitting.next_row += 1;
@@ -438,8 +586,10 @@ impl SenderFecStream {
             for emitting in self.emitting.drain(..) {
                 for (step, row) in (emitting.next_row..emitting.block.parities.len()).enumerate() {
                     due.push(ParityEmission {
-                        block: emitting.block.clone(),
-                        row,
+                        source: ParitySource::Block {
+                            block: emitting.block.clone(),
+                            row,
+                        },
                         tail_step: step as u32 + 1,
                     });
                 }
@@ -459,6 +609,63 @@ impl SenderFecStream {
     }
 }
 
+/// One speaker stream's sliding window of the most recent protectable
+/// members.
+#[derive(Debug)]
+struct SenderSlidingStream {
+    window: VecDeque<PendingMember>,
+}
+
+impl SenderSlidingStream {
+    fn new() -> Self {
+        Self {
+            window: VecDeque::new(),
+        }
+    }
+
+    /// Add the next sent frame to the window and return the parity now due:
+    /// one equation over the window, sent with the frame. A terminator also
+    /// schedules `window − 1` further equations over the final window as a
+    /// paced tail — together with the one sent with each member they solve a
+    /// loss of the whole final window — and starts the next utterance empty.
+    fn push(&mut self, window: usize, member: PendingMember) -> Vec<ParityEmission> {
+        let terminator = member.terminator;
+        let protectable =
+            !member.payload.is_empty() && member.payload.len() <= usize::from(u16::MAX);
+        if self.window.iter().any(|pending| pending.seq == member.seq) {
+            return Vec::new();
+        }
+        let mut due = Vec::new();
+        if protectable {
+            self.window.push_back(member);
+            while self.window.len() > window {
+                self.window.pop_front();
+            }
+            due.push(ParityEmission {
+                source: ParitySource::Sliding(Arc::new(encode_sliding(&self.window, 0))),
+                tail_step: 0,
+            });
+        }
+        if terminator {
+            for step in 1..self.window.len() as u32 {
+                due.push(ParityEmission {
+                    source: ParitySource::Sliding(Arc::new(encode_sliding(&self.window, step))),
+                    tail_step: step,
+                });
+            }
+            self.window.clear();
+        }
+        due
+    }
+}
+
+/// Which code protects one sender stream.
+#[derive(Debug)]
+enum SenderStream {
+    Block(SenderFecStream),
+    Sliding(SenderSlidingStream),
+}
+
 /// Sender-side FEC state shared by the voice service's send paths. Each
 /// speaker, first hop, and recipient set gets its own interleaved blocks, so
 /// a block never spans links or mixes frames sent to different recipients.
@@ -467,21 +674,25 @@ pub(crate) struct FecSenderState {
     block_size: usize,
     parity_frames: usize,
     depth: usize,
+    sliding_window: usize,
     inner: std::sync::Mutex<FecSenderInner>,
 }
 
 #[derive(Debug)]
 struct FecSenderInner {
-    streams: HashMap<FecStreamKey, SenderFecStream>,
+    streams: HashMap<FecStreamKey, (SenderStream, Instant)>,
     last_prune: Instant,
 }
 
+/// The code is part of the key: when a recipient set's capability changes,
+/// the new code starts a fresh stream instead of mixing equations.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FecStreamKey {
     sender_session: u32,
     sender_epoch: u64,
     first_hop: NodeIdentifier,
     destinations: Vec<NodeIdentifier>,
+    sliding: bool,
 }
 
 impl FecSenderState {
@@ -490,6 +701,7 @@ impl FecSenderState {
             block_size: block_size.clamp(1, MAX_BLOCK_MEMBERS),
             parity_frames: parity_frames.clamp(1, MAX_PARITY_FRAMES),
             depth: depth.clamp(1, MAX_INTERLEAVE_DEPTH),
+            sliding_window: 0,
             inner: std::sync::Mutex::new(FecSenderInner {
                 streams: HashMap::new(),
                 last_prune: Instant::now(),
@@ -497,7 +709,27 @@ impl FecSenderState {
         }
     }
 
-    /// Push a sent frame into its stream. Returns the parity it made due.
+    /// Enable sliding-window parity over `window` members toward recipients
+    /// that advertise it. A window below 2 keeps every stream on the block
+    /// code.
+    pub(crate) fn with_sliding_window(mut self, window: usize) -> Self {
+        self.sliding_window = if window < 2 {
+            0
+        } else {
+            window.min(MAX_SLIDING_WINDOW)
+        };
+        self
+    }
+
+    /// Whether any stream may use sliding-window parity. Callers skip the
+    /// recipient capability lookup when it may not.
+    pub(crate) fn sliding_enabled(&self) -> bool {
+        self.sliding_window >= 2
+    }
+
+    /// Push a sent frame into its block-code stream. Returns the parity it
+    /// made due.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &self,
@@ -509,6 +741,34 @@ impl FecSenderState {
         payload: Bytes,
         terminator: bool,
     ) -> Vec<ParityEmission> {
+        self.push_with_code(
+            first_hop,
+            destinations,
+            sender_session,
+            sender_epoch,
+            seq,
+            payload,
+            terminator,
+            false,
+        )
+    }
+
+    /// Push a sent frame into its stream, coded with sliding-window parity
+    /// when `sliding` (every recipient advertises it) and sliding parity is
+    /// enabled, else the block code. Returns the parity it made due.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_with_code(
+        &self,
+        first_hop: NodeIdentifier,
+        destinations: &[NodeIdentifier],
+        sender_session: u32,
+        sender_epoch: u64,
+        seq: u64,
+        payload: Bytes,
+        terminator: bool,
+        sliding: bool,
+    ) -> Vec<ParityEmission> {
+        let sliding = sliding && self.sliding_enabled();
         let mut destinations = destinations.to_vec();
         destinations.sort_unstable();
         destinations.dedup();
@@ -516,29 +776,37 @@ impl FecSenderState {
         let mut inner = self.inner.lock().unwrap();
         if now.saturating_duration_since(inner.last_prune) >= PRUNE_INTERVAL {
             inner.last_prune = now;
-            inner
-                .streams
-                .retain(|_, stream| now.saturating_duration_since(stream.last_used) < STREAM_IDLE);
+            inner.streams.retain(|_, (_, last_used)| {
+                now.saturating_duration_since(*last_used) < STREAM_IDLE
+            });
         }
-        let stream = inner
+        let (stream, last_used) = inner
             .streams
             .entry(FecStreamKey {
                 sender_session,
                 sender_epoch,
                 first_hop,
                 destinations,
+                sliding,
             })
-            .or_insert_with(|| SenderFecStream::new(self.depth, now));
-        stream.last_used = now;
-        stream.push(
-            self.block_size,
-            self.parity_frames,
-            PendingMember {
-                seq,
-                payload,
-                terminator,
-            },
-        )
+            .or_insert_with(|| {
+                let stream = if sliding {
+                    SenderStream::Sliding(SenderSlidingStream::new())
+                } else {
+                    SenderStream::Block(SenderFecStream::new(self.depth))
+                };
+                (stream, now)
+            });
+        *last_used = now;
+        let member = PendingMember {
+            seq,
+            payload,
+            terminator,
+        };
+        match stream {
+            SenderStream::Block(stream) => stream.push(self.block_size, self.parity_frames, member),
+            SenderStream::Sliding(stream) => stream.push(self.sliding_window, member),
+        }
     }
 }
 
@@ -556,6 +824,15 @@ struct FecBlock {
     resolved: bool,
 }
 
+/// A received sliding-window parity equation.
+#[derive(Debug)]
+struct SlidingEquation {
+    member_seqs: Vec<u64>,
+    parity: Bytes,
+    terminator_mask: u32,
+    parity_id: u64,
+}
+
 /// Receiver-side mirror of recent data frames and parity blocks for one
 /// `(sender_session, sender_epoch)`, whichever peers delivered them.
 #[derive(Debug)]
@@ -563,6 +840,8 @@ struct ReceiverFecWindow {
     window: usize,
     received: VecDeque<VoiceFrame>,
     blocks: VecDeque<FecBlock>,
+    /// Sliding-window equations that still cover an absent member.
+    equations: VecDeque<SlidingEquation>,
     /// Reconstructed members the reorder did not want yet — typically frames
     /// whose originals were only in flight. Released once they become a hole
     /// the reorder waits on, dropped when their original arrives.
@@ -576,6 +855,7 @@ impl ReceiverFecWindow {
             window: window.max(1),
             received: VecDeque::new(),
             blocks: VecDeque::new(),
+            equations: VecDeque::new(),
             stash: VecDeque::new(),
             last_used: now,
         }
@@ -646,11 +926,43 @@ impl ReceiverFecWindow {
         }
     }
 
+    fn record_sliding_parity(
+        &mut self,
+        member_seqs: Vec<u64>,
+        parity: Bytes,
+        step: u32,
+        terminator_mask: u32,
+    ) {
+        let Some(&newest) = member_seqs.iter().max() else {
+            return;
+        };
+        if member_seqs.len() > MAX_SLIDING_WINDOW || parity.len() < LENGTH_PREFIX {
+            return;
+        }
+        let parity_id = sliding_parity_id(newest, step);
+        if self
+            .equations
+            .iter()
+            .any(|equation| equation.parity_id == parity_id && equation.member_seqs == member_seqs)
+        {
+            return;
+        }
+        self.equations.push_back(SlidingEquation {
+            member_seqs,
+            parity,
+            terminator_mask,
+            parity_id,
+        });
+        while self.equations.len() > self.window {
+            self.equations.pop_front();
+        }
+    }
+
     /// Solve every unresolved block that has at least as many parity frames
-    /// as absent members, when the reorder still wants one of them. Recovered
-    /// members are recorded back into the mirror. Those `wanted` accepts —
-    /// now or from an earlier solve — are returned in seq order; the rest wait
-    /// in the stash.
+    /// as absent members, and the sliding-window equations jointly, when the
+    /// reorder still wants an absent member. Recovered members are recorded
+    /// back into the mirror. Those `wanted` accepts — now or from an earlier
+    /// solve — are returned in seq order; the rest wait in the stash.
     fn try_reconstruct(&mut self, wanted: &dyn Fn(u64) -> bool) -> Vec<VoiceFrame> {
         let mut recovered: Vec<VoiceFrame> = Vec::new();
         if self.received.is_empty() {
@@ -679,6 +991,13 @@ impl ReceiverFecWindow {
         for frame in &recovered {
             self.mirror_frame(frame.clone());
         }
+        // Block recoveries are mirrored first: they are known members of the
+        // sliding equations.
+        let sliding = self.solve_sliding(wanted);
+        for frame in &sliding {
+            self.mirror_frame(frame.clone());
+        }
+        recovered.extend(sliding);
         self.stash.extend(recovered.drain(..));
         self.stash.retain(|frame| {
             if wanted(frame.s2s_seq) {
@@ -694,6 +1013,123 @@ impl ReceiverFecWindow {
         recovered.sort_by_key(|frame| frame.s2s_seq);
         recovered.dedup_by_key(|frame| frame.s2s_seq);
         recovered
+    }
+}
+
+impl ReceiverFecWindow {
+    /// Solve the sliding-window equations jointly for their absent members.
+    /// Every equation still covering an absent member contributes one row
+    /// over the absent members; the parity minus every mirrored member's
+    /// contribution is its right-hand side. Gauss-Jordan elimination pins an
+    /// absent member only when its reduced row has no other absent member, so
+    /// an under-determined system recovers exactly what it determines and
+    /// never guesses. Equations with no absent member left are dropped.
+    fn solve_sliding(&mut self, wanted: &dyn Fn(u64) -> bool) -> Vec<VoiceFrame> {
+        let received = &self.received;
+        let mirrored = |seq: u64| received.iter().find(|frame| frame.s2s_seq == seq);
+        self.equations.retain(|equation| {
+            equation
+                .member_seqs
+                .iter()
+                .any(|seq| mirrored(*seq).is_none())
+        });
+        let mut absent: Vec<u64> = self
+            .equations
+            .iter()
+            .flat_map(|equation| equation.member_seqs.iter().copied())
+            .filter(|seq| mirrored(*seq).is_none())
+            .collect();
+        absent.sort_unstable();
+        absent.dedup();
+        if !absent.iter().any(|seq| wanted(*seq)) {
+            return Vec::new();
+        }
+        let symbol_len = self
+            .equations
+            .iter()
+            .map(|equation| equation.parity.len())
+            .max()
+            .unwrap_or(0);
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for equation in &self.equations {
+            // A mirrored frame longer than the equation's symbols is not the
+            // member the sender coded; this equation cannot be trusted.
+            let consistent = equation.member_seqs.iter().all(|seq| {
+                mirrored(*seq).is_none_or(|frame| {
+                    frame.payload.len() + LENGTH_PREFIX <= equation.parity.len()
+                })
+            });
+            if !consistent {
+                continue;
+            }
+            let mut coefficients = vec![0u8; absent.len()];
+            let mut rhs = vec![0u8; symbol_len];
+            rhs[..equation.parity.len()].copy_from_slice(&equation.parity);
+            for &seq in &equation.member_seqs {
+                let coefficient = sliding_coefficient(equation.parity_id, seq);
+                match mirrored(seq) {
+                    Some(frame) => mul_acc_symbol(&mut rhs, &frame.payload, coefficient),
+                    None => {
+                        let column = absent
+                            .binary_search(&seq)
+                            .expect("every absent member has a column");
+                        coefficients[column] = coefficient;
+                    }
+                }
+            }
+            rows.push((coefficients, rhs));
+        }
+        let mut pivots: Vec<(usize, usize)> = Vec::new();
+        for column in 0..absent.len() {
+            let next = pivots.len();
+            let Some(pivot) = (next..rows.len()).find(|&row| rows[row].0[column] != 0) else {
+                continue;
+            };
+            rows.swap(next, pivot);
+            let scale = gf_inv(rows[next].0[column]);
+            let (coefficients, rhs) = &mut rows[next];
+            for value in coefficients.iter_mut().chain(rhs.iter_mut()) {
+                *value = gf_mul(*value, scale);
+            }
+            let (pivot_coefficients, pivot_rhs) = rows[next].clone();
+            for (row, (coefficients, rhs)) in rows.iter_mut().enumerate() {
+                let factor = coefficients[column];
+                if row == next || factor == 0 {
+                    continue;
+                }
+                mul_acc(coefficients, &pivot_coefficients, factor);
+                mul_acc(rhs, &pivot_rhs, factor);
+            }
+            pivots.push((next, column));
+        }
+        let mut solved = Vec::new();
+        for (row, column) in pivots {
+            let (coefficients, symbol) = &rows[row];
+            if coefficients
+                .iter()
+                .enumerate()
+                .any(|(other, value)| other != column && *value != 0)
+            {
+                continue;
+            }
+            let len = usize::from(u16::from_be_bytes([symbol[0], symbol[1]]));
+            if len == 0 || LENGTH_PREFIX + len > symbol_len {
+                continue;
+            }
+            let seq = absent[column];
+            let is_terminator = self.equations.iter().any(|equation| {
+                equation
+                    .member_seqs
+                    .iter()
+                    .position(|member| *member == seq)
+                    .is_some_and(|index| (equation.terminator_mask >> index) & 1 == 1)
+            });
+            let payload = Bytes::copy_from_slice(&symbol[LENGTH_PREFIX..LENGTH_PREFIX + len]);
+            if let Some(frame) = frame_from_template(&self.received, seq, payload, is_terminator) {
+                solved.push(frame);
+            }
+        }
+        solved
     }
 }
 
@@ -794,10 +1230,21 @@ fn recovered_frame(
     seq: u64,
     payload: Bytes,
 ) -> Option<VoiceFrame> {
+    let is_terminator = (block.terminator_mask >> member) & 1 == 1;
+    frame_from_template(received, seq, payload, is_terminator)
+}
+
+/// A reconstructed data frame for `seq`, with routing metadata copied from
+/// the mirrored frame closest in seq. `None` when the mirror is empty.
+fn frame_from_template(
+    received: &VecDeque<VoiceFrame>,
+    seq: u64,
+    payload: Bytes,
+    is_terminator: bool,
+) -> Option<VoiceFrame> {
     let template = received
         .iter()
         .min_by_key(|frame| frame.s2s_seq.abs_diff(seq))?;
-    let is_terminator = (block.terminator_mask >> member) & 1 == 1;
     Some(VoiceFrame {
         sender_session: template.sender_session,
         server_id: template.server_id.clone(),
@@ -859,7 +1306,8 @@ impl ReceiverFecState {
     }
 
     /// Record a received parity frame. Returns `false` (and records nothing)
-    /// for a wire index outside the Reed-Solomon scheme.
+    /// for a wire index outside both the Reed-Solomon and the sliding-window
+    /// schemes.
     pub(crate) fn record_parity(
         &self,
         sender_session: u32,
@@ -869,18 +1317,25 @@ impl ReceiverFecState {
         wire_index: u32,
         terminator_mask: u32,
     ) -> bool {
-        let Some(row) = rs_parity_row(wire_index) else {
-            return false;
-        };
         let key = MirrorKey {
             sender_session,
             sender_epoch,
         };
-        let mut inner = self.inner.lock().unwrap();
-        inner
-            .mirror_mut(key)
-            .record_parity(member_seqs, parity, row, terminator_mask);
-        true
+        if let Some(row) = rs_parity_row(wire_index) {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .mirror_mut(key)
+                .record_parity(member_seqs, parity, row, terminator_mask);
+            return true;
+        }
+        if let Some(step) = sliding_parity_step(wire_index) {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .mirror_mut(key)
+                .record_sliding_parity(member_seqs, parity, step, terminator_mask);
+            return true;
+        }
+        false
     }
 
     /// Reconstruct block members for this sender that `wanted` accepts.
@@ -1065,8 +1520,8 @@ pub(crate) mod tests {
             .into_iter()
             .map(|emission| {
                 (
-                    emission.block.member_seqs.clone(),
-                    emission.row,
+                    emission.member_seqs().to_vec(),
+                    (emission.wire_index() - RS_PARITY_INDEX_BASE) as usize,
                     emission.tail_step,
                 )
             })
@@ -1112,7 +1567,7 @@ pub(crate) mod tests {
         let terminator = FecSenderState::new(4, 2, 2)
             .push(2, &[9], 7, 42, 0, Bytes::from(payload_for(0)), true)
             .remove(0);
-        assert_eq!(terminator.block.terminator_mask, 1);
+        assert_eq!(terminator.terminator_mask(), 1);
         assert_eq!(terminator.delay(), Duration::ZERO);
     }
 
@@ -1134,7 +1589,7 @@ pub(crate) mod tests {
             let emissions =
                 sender.push(hop, &[dst], 7, 42, seq, Bytes::from_static(b"abcd"), false);
             assert_eq!(emissions.len(), 1);
-            assert_eq!(emissions[0].block.member_seqs, members);
+            assert_eq!(emissions[0].member_seqs(), members);
         }
     }
 
@@ -1152,7 +1607,7 @@ pub(crate) mod tests {
                 .is_empty()
         );
         let emissions = sender.push(2, &[9], 7, 42, 2, Bytes::from_static(b"cdef"), false);
-        assert_eq!(emissions[0].block.member_seqs, vec![1, 2]);
+        assert_eq!(emissions[0].member_seqs(), vec![1, 2]);
     }
 
     #[test]
@@ -1357,10 +1812,35 @@ pub(crate) mod tests {
         frames: u64,
         diverse: bool,
         deadline: u64,
+        lose: impl FnMut(FecParityPath, u64) -> bool,
+    ) -> (u64, u64) {
+        simulate_code(
+            FecSenderState::new(block_size, parity, depth),
+            false,
+            receiver_window_for(0, block_size, depth, 0),
+            parity as u64,
+            frames,
+            diverse,
+            deadline,
+            lose,
+        )
+    }
+
+    /// [`simulate`] for any code: `sliding` streams use the sender's
+    /// sliding window, and `tail_slots` covers the parity paced after the
+    /// final terminator.
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_code(
+        sender: FecSenderState,
+        sliding: bool,
+        receiver_window: usize,
+        tail_slots: u64,
+        frames: u64,
+        diverse: bool,
+        deadline: u64,
         mut lose: impl FnMut(FecParityPath, u64) -> bool,
     ) -> (u64, u64) {
-        let sender = FecSenderState::new(block_size, parity, depth);
-        let receiver = ReceiverFecState::new(receiver_window_for(0, block_size, depth));
+        let receiver = ReceiverFecState::new(receiver_window);
         let mut delivered = std::collections::HashSet::new();
         let mut settled = std::collections::HashSet::new();
         let mut in_flight: std::collections::BTreeMap<u64, Vec<VoiceFrame>> = Default::default();
@@ -1370,7 +1850,7 @@ pub(crate) mod tests {
         } else {
             FecParityPath::Primary
         };
-        let last_slot = frames + parity as u64 + 1;
+        let last_slot = frames + tail_slots + 1;
         for slot in 0..last_slot {
             if slot < frames {
                 let seq = slot;
@@ -1383,7 +1863,16 @@ pub(crate) mod tests {
                     settled.insert(seq);
                     receiver.record_frame(frame(seq, &payload, terminator));
                 }
-                for emission in sender.push(3, &[9], 7, 11, seq, Bytes::from(payload), terminator) {
+                for emission in sender.push_with_code(
+                    3,
+                    &[9],
+                    7,
+                    11,
+                    seq,
+                    Bytes::from(payload),
+                    terminator,
+                    sliding,
+                ) {
                     let arrival = slot + u64::from(emission.tail_step);
                     if lose(parity_path, arrival) {
                         continue;
@@ -1484,5 +1973,359 @@ pub(crate) mod tests {
             (6..12).contains(&slot)
         });
         assert!(same_path > 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Sliding-window parity.
+
+    /// What a sender emits for frames `0..frames` of one stream: per sent
+    /// frame, the parity wire bodies it made due, in order.
+    fn sent_parity(
+        sender: &FecSenderState,
+        frames: u64,
+        terminator_at: Option<u64>,
+        sliding: bool,
+    ) -> Vec<Vec<VoiceFrame>> {
+        (0..frames)
+            .map(|seq| {
+                sender
+                    .push_with_code(
+                        3,
+                        &[9],
+                        7,
+                        11,
+                        seq,
+                        Bytes::from(payload_for(seq)),
+                        terminator_at == Some(seq),
+                        sliding,
+                    )
+                    .into_iter()
+                    .map(|emission| proto::decode_voice(&emission.encode(7, 11).unwrap()).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Feed a receiver the data frames and parity frames a lossy path kept.
+    fn deliver(
+        receiver: &ReceiverFecState,
+        parity: &[Vec<VoiceFrame>],
+        terminator_at: Option<u64>,
+        data_kept: impl Fn(u64) -> bool,
+        parity_kept: impl Fn(u64) -> bool,
+    ) {
+        for (seq, rows) in parity.iter().enumerate() {
+            let seq = seq as u64;
+            if data_kept(seq) {
+                receiver.record_frame(frame(seq, &payload_for(seq), terminator_at == Some(seq)));
+            }
+            if parity_kept(seq) {
+                for row in rows {
+                    assert!(receiver.record_parity(
+                        7,
+                        11,
+                        row.fec_member_seqs.clone(),
+                        row.payload.clone(),
+                        row.fec_parity_index,
+                        row.fec_terminator_mask,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn recovered_seqs(receiver: &ReceiverFecState) -> Vec<u64> {
+        let recovered = receiver.try_reconstruct(7, 11, &any);
+        for frame in &recovered {
+            assert_eq!(
+                frame.payload.as_ref(),
+                payload_for(frame.s2s_seq).as_slice()
+            );
+        }
+        recovered.iter().map(|frame| frame.s2s_seq).collect()
+    }
+
+    fn sliding_sender(window: usize) -> FecSenderState {
+        FecSenderState::new(3, 3, 2).with_sliding_window(window)
+    }
+
+    #[test]
+    fn sliding_parity_follows_every_frame_over_the_last_window_members() {
+        let sent = sent_parity(&sliding_sender(4), 6, None, true);
+        for (seq, rows) in sent.iter().enumerate() {
+            let seq = seq as u64;
+            assert_eq!(rows.len(), 1, "one equation per data frame");
+            let first = seq.saturating_sub(3);
+            assert_eq!(rows[0].fec_member_seqs, (first..=seq).collect::<Vec<_>>());
+            assert_eq!(rows[0].fec_parity_index, SLIDING_PARITY_INDEX_BASE);
+            assert_eq!(rows[0].s2s_seq, seq);
+        }
+        // Without the recipients' capability, or with the window off, the same
+        // sender keeps the block code.
+        let block = sent_parity(&sliding_sender(4), 6, None, false);
+        let disabled = sent_parity(&sliding_sender(0), 6, None, true);
+        for rows in block.iter().chain(&disabled).flatten() {
+            assert!(rs_parity_row(rows.fec_parity_index).is_some());
+        }
+    }
+
+    /// The point of the code: a single loss is solvable from the parity sent
+    /// with the lost frame, before any later frame exists. The default block
+    /// code cannot solve it until the frame's block completes.
+    #[test]
+    fn a_single_loss_is_recovered_from_the_parity_sent_with_it() {
+        for lost in 0..6 {
+            let sent = sent_parity(&sliding_sender(4), lost + 1, None, true);
+            let receiver = ReceiverFecState::new(32);
+            deliver(&receiver, &sent, None, |seq| seq != lost, |_| true);
+            // Frame 0 has nothing earlier to copy routing metadata from.
+            if lost > 0 {
+                assert_eq!(recovered_seqs(&receiver), vec![lost], "lost {lost}");
+            }
+        }
+        // The same loss under the default block code, with everything sent up
+        // to and including the lost frame delivered, is not yet solvable: seq
+        // 3 sits in the block {1, 3, 5}, whose first parity leaves with 5.
+        let block = sent_parity(&FecSenderState::new(3, 3, 2), 4, None, false);
+        let receiver = ReceiverFecState::new(32);
+        deliver(&receiver, &block, None, |seq| seq != 3, |_| true);
+        assert!(recovered_seqs(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_burst_whose_parity_survives_is_recovered_jointly_at_its_last_frame() {
+        for burst in 2..=6u64 {
+            let first = 8;
+            let last = first + burst - 1;
+            let sent = sent_parity(&sliding_sender(4), last + 1, None, true);
+            let receiver = ReceiverFecState::new(32);
+            deliver(
+                &receiver,
+                &sent,
+                None,
+                |seq| !(first..=last).contains(&seq),
+                |_| true,
+            );
+            // Each lost frame's own parity still covers it, and every newer
+            // equation adds one unknown: the system is triangular.
+            assert_eq!(
+                recovered_seqs(&receiver),
+                (first..=last).collect::<Vec<_>>(),
+                "burst {burst}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_burst_that_takes_its_parity_too_is_recovered_up_to_window_minus_one() {
+        let window = 4u64;
+        for burst in 1..=window {
+            let first = 8;
+            let last = first + burst - 1;
+            // Enough later frames for every equation that still covers the
+            // burst to be sent.
+            let sent = sent_parity(&sliding_sender(window as usize), last + window, None, true);
+            let receiver = ReceiverFecState::new(32);
+            let lost = |seq: u64| (first..=last).contains(&seq);
+            deliver(&receiver, &sent, None, |seq| !lost(seq), |seq| !lost(seq));
+            let recovered = recovered_seqs(&receiver);
+            if burst < window {
+                assert_eq!(
+                    recovered,
+                    (first..=last).collect::<Vec<_>>(),
+                    "burst {burst}"
+                );
+            } else {
+                // No surviving equation covers the burst's first frame. The
+                // rest are pinned only if the equations determine them; none
+                // is ever guessed.
+                assert!(!recovered.contains(&first), "burst {burst}: {recovered:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_tail_after_a_terminator_recovers_the_final_window() {
+        let sent = sent_parity(&sliding_sender(4), 4, Some(3), true);
+        // With the terminator: its own equation plus three paced tail steps,
+        // all over the final window.
+        assert_eq!(
+            sent[3]
+                .iter()
+                .map(|row| row.fec_parity_index - SLIDING_PARITY_INDEX_BASE)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        let receiver = ReceiverFecState::new(32);
+        // Frames 2 and 3 and the equations sent with them are lost; the tail
+        // that follows the terminator survives.
+        deliver(&receiver, &sent, Some(3), |seq| seq < 2, |seq| seq < 2);
+        for row in &sent[3][1..] {
+            receiver.record_parity(
+                7,
+                11,
+                row.fec_member_seqs.clone(),
+                row.payload.clone(),
+                row.fec_parity_index,
+                row.fec_terminator_mask,
+            );
+        }
+        let recovered = receiver.try_reconstruct(7, 11, &any);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|frame| (frame.s2s_seq, frame.is_terminator))
+                .collect::<Vec<_>>(),
+            vec![(2, false), (3, true)]
+        );
+        // The next utterance starts a fresh window.
+        let next = sliding_sender(4);
+        sent_parity(&next, 4, Some(3), true);
+        let after =
+            next.push_with_code(3, &[9], 7, 11, 4, Bytes::from(payload_for(4)), false, true);
+        assert_eq!(after[0].member_seqs(), vec![4]);
+    }
+
+    #[test]
+    fn an_underdetermined_system_recovers_nothing() {
+        let sent = sent_parity(&sliding_sender(4), 6, None, true);
+        let receiver = ReceiverFecState::new(32);
+        // 3 and 4 lost; only the equation sent with 5 survives, and it covers
+        // both: one equation, two unknowns.
+        deliver(
+            &receiver,
+            &sent,
+            None,
+            |seq| seq != 3 && seq != 4,
+            |seq| seq == 5,
+        );
+        assert!(recovered_seqs(&receiver).is_empty());
+    }
+
+    #[test]
+    fn sliding_recovery_honours_wanted_and_yields_to_the_original() {
+        let sent = sent_parity(&sliding_sender(4), 5, None, true);
+        let receiver = ReceiverFecState::new(32);
+        deliver(&receiver, &sent, None, |seq| seq != 4, |_| true);
+        // Nothing is wanted yet: solved but stashed.
+        assert!(receiver.try_reconstruct(7, 11, &|_| false).is_empty());
+        assert_eq!(recovered_seqs(&receiver), vec![4]);
+    }
+
+    #[test]
+    fn block_only_and_sliding_wire_indices_never_overlap() {
+        for step in 0..MAX_SLIDING_WINDOW as u32 {
+            assert_eq!(rs_parity_row(SLIDING_PARITY_INDEX_BASE + step), None);
+            assert_eq!(
+                sliding_parity_step(SLIDING_PARITY_INDEX_BASE + step),
+                Some(step)
+            );
+        }
+        for row in 0..MAX_PARITY_FRAMES as u32 {
+            assert_eq!(sliding_parity_step(RS_PARITY_INDEX_BASE + row), None);
+        }
+        assert_eq!(
+            sliding_parity_step(SLIDING_PARITY_INDEX_BASE + MAX_SLIDING_WINDOW as u32),
+            None
+        );
+    }
+
+    /// The window the receiver mirrors covers two sliding windows.
+    #[test]
+    fn the_receiver_window_covers_the_sliding_window() {
+        assert_eq!(receiver_window_for(0, 2, 1, 16), 32);
+        assert_eq!(receiver_window_for(0, 2, 1, 64), 2 * MAX_SLIDING_WINDOW);
+        assert_eq!(receiver_window_for(40, 3, 2, 4), 40);
+    }
+
+    /// The production condition: losses on the data path, parity on an
+    /// independent alternate. "In time" is recovered in the very slot the
+    /// frame was due — before the next frame arrives and the reorder
+    /// releases past it. The block code makes only the member that completes
+    /// its block in time (about a third of losses); the sliding window makes
+    /// nearly all of them, at the same one-parity-per-frame overhead.
+    #[test]
+    fn sliding_parity_recovers_losses_before_the_release_where_blocks_cannot() {
+        let frames = 60_000;
+        let slots = frames as usize + 32;
+        for (mean_burst, seed) in [(1.0, 0x51_1DE), (2.0, 0xB0_B5)] {
+            let primary = burst_states(seed, slots, 0.02, mean_burst);
+            let alternate = burst_states(seed ^ 0xA17, slots, 0.005, mean_burst);
+            let lose = |path: FecParityPath, slot: u64| match path {
+                FecParityPath::Primary | FecParityPath::Tree => primary[slot as usize],
+                FecParityPath::Alternate => alternate[slot as usize],
+            };
+            let (raw, block) = simulate_code(
+                FecSenderState::new(3, 3, 2),
+                false,
+                receiver_window_for(0, 3, 2, 0),
+                3,
+                frames,
+                true,
+                0,
+                lose,
+            );
+            let (_, sliding) = simulate_code(
+                FecSenderState::new(3, 3, 2).with_sliding_window(4),
+                true,
+                receiver_window_for(0, 3, 2, 4),
+                4,
+                frames,
+                true,
+                0,
+                lose,
+            );
+            let raw = raw as f64 / frames as f64;
+            let block = block as f64 / frames as f64;
+            let sliding = sliding as f64 / frames as f64;
+            assert!(
+                (0.015..0.025).contains(&raw),
+                "burst {mean_burst}: raw {raw}"
+            );
+            assert!(
+                block > raw / 2.0,
+                "burst {mean_burst}: block in time {block} of {raw}"
+            );
+            assert!(
+                sliding < raw / 10.0,
+                "burst {mean_burst}: sliding in time {sliding} of {raw} (block {block})"
+            );
+        }
+    }
+
+    /// Given time, the sliding window recovers at least as much as the
+    /// default block code at its own overhead when the parity path is
+    /// independent.
+    #[test]
+    fn sliding_parity_eventual_recovery_matches_the_block_code() {
+        let frames = 60_000;
+        let slots = frames as usize + 32;
+        let primary = burst_states(0xD00D, slots, 0.05, 2.0);
+        let alternate = burst_states(0xFEED, slots, 0.02, 2.0);
+        let lose = |path: FecParityPath, slot: u64| match path {
+            FecParityPath::Primary | FecParityPath::Tree => primary[slot as usize],
+            FecParityPath::Alternate => alternate[slot as usize],
+        };
+        let (_, block) = simulate_code(
+            FecSenderState::new(3, 3, 2),
+            false,
+            receiver_window_for(0, 3, 2, 0),
+            3,
+            frames,
+            true,
+            10,
+            lose,
+        );
+        let (_, sliding) = simulate_code(
+            FecSenderState::new(3, 3, 2).with_sliding_window(4),
+            true,
+            receiver_window_for(0, 3, 2, 4),
+            4,
+            frames,
+            true,
+            10,
+            lose,
+        );
+        assert!(sliding <= block, "sliding {sliding} vs block {block}");
     }
 }

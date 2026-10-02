@@ -219,6 +219,46 @@ async fn new_channel_names_are_pushed_to_weblate() {
     recv_channel_name(&carmen, music, "Música").await;
 }
 
+/// One name Weblate rejects must not block the rest of the batch. Names are
+/// pushed in sorted order, so a batch that stops at the first error leaves
+/// every later name unpushed and retries the same failing name first on every
+/// poll.
+#[tokio::test]
+async fn a_rejected_name_does_not_block_the_other_pushes() {
+    let mock = channel_name_component().await;
+    // Armed before the channels exist, so no poll can push "Bad" successfully.
+    mock.fail_add("Bad", 500);
+    let server = server_with_channel_names(&mock).await;
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    // Sorted push order is "Alpha", "Bad", "Zulu".
+    create_channel(&admin, "Alpha").await;
+    create_channel(&admin, "Bad").await;
+    create_channel(&admin, "Zulu").await;
+
+    wait_until(
+        || {
+            let keys = mock.source_keys();
+            keys.iter().any(|key| key == "Alpha") && keys.iter().any(|key| key == "Zulu")
+        },
+        "\"Zulu\" to be pushed even though \"Bad\" is rejected",
+    )
+    .await;
+    assert!(
+        !mock.added_keys().iter().any(|key| key == "Bad"),
+        "the rejected name is not recorded as pushed: {:?}",
+        mock.added_keys()
+    );
+
+    mock.clear_add_failures();
+    wait_until(
+        || mock.source_keys().iter().any(|key| key == "Bad"),
+        "the rejected name to be retried on a later poll",
+    )
+    .await;
+}
+
 /// Changing a connected client's language (as reauthentication can) re-sends
 /// every channel name it can see, including reverting names that have no
 /// translation in the new language.
@@ -253,6 +293,51 @@ async fn language_change_resends_visible_channel_names() {
     assert!(
         !server.server.apply_client_language(&client, Some(language("es"))),
         "reapplying the same language is not a change"
+    );
+}
+
+/// A client holding `no_channel_name_translation` is always shown the names as
+/// entered, even in a translated language and even when the translations
+/// change under it.
+#[tokio::test]
+async fn no_channel_name_translation_supplies_the_raw_names() {
+    const QUIET: Duration = Duration::from_millis(300);
+    let mock = channel_name_component().await;
+    let server = server_with_channel_names(&mock).await;
+    server
+        .authenticator
+        .register_user_with_language("carlos", None, Some(4), vec![], language("es-MX"));
+    server.authenticator.set_privileges(
+        "carlos",
+        [shitspeak_auth::Privilege::NoChannelNameTranslation],
+    );
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    let lobby = create_channel(&admin, "Lobby").await;
+    wait_for_translation(&server, "es", "Lobby", "Vestíbulo").await;
+
+    let carmen = TestClient::connect_and_authenticate(&server, "carmen", None)
+        .await
+        .expect("carmen");
+    let carlos = TestClient::connect_and_authenticate(&server, "carlos", None)
+        .await
+        .expect("carlos");
+
+    assert_eq!(initial_name(&carmen, lobby), Some("Vestíbulo"));
+    assert_eq!(initial_name(&carmen, 0), Some("Raíz"));
+    assert_eq!(initial_name(&carlos, lobby), Some("Lobby"));
+    assert_eq!(initial_name(&carlos, 0), Some("Root"));
+
+    mock.translate("es", "Lobby", "Sala de espera");
+
+    recv_channel_name(&carmen, lobby, "Sala de espera").await;
+    let unexpected = carlos
+        .recv_until(|message| matches!(message, Message::ChannelState(_)), QUIET)
+        .await;
+    assert!(
+        unexpected.is_none(),
+        "a translation update must not re-send names to a no_channel_name_translation client: {unexpected:?}"
     );
 }
 

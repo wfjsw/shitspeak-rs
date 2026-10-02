@@ -43,6 +43,15 @@ pub struct VoiceConfig {
     /// Defaults to 0 so missing packets do not stall newer audio unnecessarily.
     pub chunk_hold_budget_ms: u64,
 
+    /// How long after the reorder released past a missing sequence the earliest
+    /// surviving copy of it may still emit, out of order (0 through 200).
+    /// Beyond this age no listener jitter buffer still holds the slot. A
+    /// default Mumble client plays a 10 ms margin on top of a delay it adapts
+    /// to the jitter it observes, so a fill is audible on a clean edge only
+    /// within ~10 ms of the release, and somewhat later on a jittery one.
+    /// 0 disables late fills entirely.
+    pub voice_late_fill_window_ms: u64,
+
     /// Fast-path bypass — receivers emit frames in arrival order without
     /// any pending state. Useful when the operator's backbone genuinely
     /// doesn't reorder.
@@ -130,8 +139,16 @@ pub struct VoiceConfig {
     /// Minimum number of recent data frames per `(sender_session,
     /// sender_epoch, from)` the receiver mirrors to solve parity blocks, and
     /// of parity blocks it retains. Raised automatically to two interleave
-    /// spans (`2 × block_size × interleave_depth`).
+    /// spans (`2 × block_size × interleave_depth`) and two sliding windows.
     pub voice_fec_receiver_window: usize,
+
+    /// Members each sliding-window parity covers (0, or 2 through 16). Toward
+    /// recipients that all advertise sliding-window parity, every data frame
+    /// is followed at once by one parity over the last this-many frames, so a
+    /// single loss is recoverable as soon as that parity lands and a burst up
+    /// to this length jointly. Other recipients keep the block code. 0 stops
+    /// both sending and advertising it.
+    pub voice_fec_sliding_window: usize,
 }
 
 impl Default for VoiceConfig {
@@ -144,6 +161,7 @@ impl Default for VoiceConfig {
             reorder_max_total_buffer: default_reorder_max_total_buffer(),
             reorder_idle_reset_ms: default_reorder_idle_reset_ms(),
             chunk_hold_budget_ms: default_chunk_hold_budget_ms(),
+            voice_late_fill_window_ms: default_voice_late_fill_window_ms(),
             reorder_disabled: false,
             adaptive_jitter_enabled: default_adaptive_jitter_enabled(),
             adaptive_jitter_min_delay_ms: default_adaptive_jitter_min_delay_ms(),
@@ -167,6 +185,7 @@ impl Default for VoiceConfig {
             voice_fec_parity_blocks: default_voice_fec_parity_blocks(),
             voice_fec_interleave_depth: default_voice_fec_interleave_depth(),
             voice_fec_receiver_window: default_voice_fec_receiver_window(),
+            voice_fec_sliding_window: default_voice_fec_sliding_window(),
         }
     }
 }
@@ -187,6 +206,8 @@ struct VoiceConfigWire {
     reorder_idle_reset_ms: u64,
     #[serde(default = "default_chunk_hold_budget_ms")]
     chunk_hold_budget_ms: u64,
+    #[serde(default = "default_voice_late_fill_window_ms")]
+    voice_late_fill_window_ms: u64,
     #[serde(default)]
     reorder_disabled: bool,
     #[serde(default = "default_adaptive_jitter_enabled")]
@@ -257,6 +278,8 @@ struct VoiceConfigWire {
     voice_fec_interleave_depth: usize,
     #[serde(default = "default_voice_fec_receiver_window")]
     voice_fec_receiver_window: usize,
+    #[serde(default = "default_voice_fec_sliding_window")]
+    voice_fec_sliding_window: usize,
     // Accepted for compatibility; enabled FEC no longer waits for loss.
     #[serde(default)]
     voice_fec_loss_gate_ppm: Option<IgnoredAny>,
@@ -286,6 +309,16 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         if raw.voice_fec_interleave_depth < 1 || raw.voice_fec_interleave_depth > 8 {
             return Err(D::Error::custom(
                 "voice_fec_interleave_depth must be between 1 and 8",
+            ));
+        }
+        if raw.voice_fec_sliding_window == 1 || raw.voice_fec_sliding_window > 16 {
+            return Err(D::Error::custom(
+                "voice_fec_sliding_window must be 0 or between 2 and 16",
+            ));
+        }
+        if raw.voice_late_fill_window_ms > 200 {
+            return Err(D::Error::custom(
+                "voice_late_fill_window_ms must be between 0 and 200",
             ));
         }
         if raw.adaptive_jitter_target_percentile < 50 || raw.adaptive_jitter_target_percentile > 100
@@ -327,6 +360,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             reorder_max_total_buffer: raw.reorder_max_total_buffer,
             reorder_idle_reset_ms: raw.reorder_idle_reset_ms,
             chunk_hold_budget_ms: raw.chunk_hold_budget_ms,
+            voice_late_fill_window_ms: raw.voice_late_fill_window_ms,
             reorder_disabled: raw.reorder_disabled,
             adaptive_jitter_enabled: raw.adaptive_jitter_enabled,
             adaptive_jitter_min_delay_ms: raw.adaptive_jitter_min_delay_ms,
@@ -350,6 +384,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             voice_fec_parity_blocks: raw.voice_fec_parity_blocks,
             voice_fec_interleave_depth: raw.voice_fec_interleave_depth,
             voice_fec_receiver_window: raw.voice_fec_receiver_window,
+            voice_fec_sliding_window: raw.voice_fec_sliding_window,
         })
     }
 }
@@ -404,6 +439,9 @@ fn default_reorder_idle_reset_ms() -> u64 {
 }
 fn default_chunk_hold_budget_ms() -> u64 {
     0
+}
+fn default_voice_late_fill_window_ms() -> u64 {
+    40
 }
 fn default_adaptive_jitter_enabled() -> bool {
     true
@@ -468,6 +506,11 @@ fn default_voice_fec_interleave_depth() -> usize {
 fn default_voice_fec_receiver_window() -> usize {
     32
 }
+/// Covers a run of up to four consecutive losses, which is 96 % of the reorder
+/// gaps observed in production.
+fn default_voice_fec_sliding_window() -> usize {
+    4
+}
 
 #[cfg(test)]
 mod tests {
@@ -512,11 +555,21 @@ mod tests {
         .unwrap();
         assert_eq!(custom.voice_fec_parity_blocks, 16);
         assert_eq!(custom.voice_fec_interleave_depth, 8);
+        assert_eq!(cfg.voice_fec_sliding_window, 4);
+        for (raw, window) in [
+            (r#"{"voice_fec_sliding_window":0}"#, 0),
+            (r#"{"voice_fec_sliding_window":16}"#, 16),
+        ] {
+            let parsed: VoiceConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed.voice_fec_sliding_window, window);
+        }
         for invalid in [
             r#"{"voice_fec_parity_blocks":0}"#,
             r#"{"voice_fec_parity_blocks":17}"#,
             r#"{"voice_fec_interleave_depth":0}"#,
             r#"{"voice_fec_interleave_depth":9}"#,
+            r#"{"voice_fec_sliding_window":1}"#,
+            r#"{"voice_fec_sliding_window":17}"#,
         ] {
             assert!(
                 serde_json::from_str::<VoiceConfig>(invalid).is_err(),

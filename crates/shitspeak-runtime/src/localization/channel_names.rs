@@ -186,9 +186,10 @@ pub(crate) enum ChannelNameRefresh {
     /// Translations changed; clients whose language is affected re-send the
     /// listed channels.
     Translations(ChannelNamesChanged),
-    /// One client's language changed (e.g. on reauthentication); it re-sends
-    /// every channel it can see.
-    ClientLanguage(crate::client::ClientInstanceId),
+    /// The way one client is shown names changed — its language, or its
+    /// `no_channel_name_translation` entitlement (e.g. on reauthentication);
+    /// it re-sends every channel it can see.
+    ClientNames(crate::client::ClientInstanceId),
 }
 
 /// A channel-name translation change, with the channels it affects on this
@@ -279,16 +280,12 @@ async fn raw_channel_names(server: &Server) -> HashSet<String> {
 }
 
 /// Add channel names that Weblate does not know yet as source strings.
-async fn push_new_names(
-    server: &Server,
-    client: &WeblateClient,
-    cache: &mut TranslationCache,
-) -> Result<(), super::weblate::WeblateError> {
+async fn push_new_names(server: &Server, client: &WeblateClient, cache: &mut TranslationCache) {
     let Some(source_code) = cache.source_code().map(str::to_owned) else {
         tracing::warn!(
             "channel-name Weblate component reports no source language; not pushing names"
         );
-        return Ok(());
+        return;
     };
     let mut missing: Vec<String> = raw_channel_names(server)
         .await
@@ -297,18 +294,32 @@ async fn push_new_names(
         .collect();
     missing.sort();
     let total = missing.len();
+    let mut pushed = 0usize;
+    let mut failed = 0usize;
     for name in missing.into_iter().take(MAX_NAMES_PUSHED_PER_POLL) {
-        client.add_source_string(&source_code, &name, &name).await?;
-        cache.insert_source_key(&name);
+        match client.add_source_string(&source_code, &name, &name).await {
+            Ok(()) => {
+                cache.insert_source_key(&name);
+                pushed += 1;
+            }
+            Err(error) => {
+                // Keep going: the names are pushed in sorted order, so a batch
+                // that stops at the first error would leave every later name
+                // unpushed and retry the same failing name first on every poll.
+                // A rejected name stays missing and is tried again next poll.
+                failed += 1;
+                tracing::warn!(%error, %name, "pushing a channel name to Weblate failed");
+            }
+        }
     }
     if total > 0 {
         tracing::info!(
-            pushed = total.min(MAX_NAMES_PUSHED_PER_POLL),
-            remaining = total.saturating_sub(MAX_NAMES_PUSHED_PER_POLL),
+            pushed,
+            failed,
+            remaining = total.saturating_sub(pushed),
             "pushed new channel names to Weblate"
         );
     }
-    Ok(())
 }
 
 fn active_config(server: &Server) -> Option<ChannelNameTranslationConfig> {
@@ -361,10 +372,8 @@ impl WeblateSyncJob for ChannelNameSync {
             }
         };
         let before_push = cache.clone();
-        if config.push_names()
-            && let Err(error) = push_new_names(server, client, cache).await
-        {
-            tracing::warn!(%error, "pushing channel names to Weblate failed");
+        if config.push_names() {
+            push_new_names(server, client, cache).await;
         }
         if changed {
             apply_channel_name_cache(server, cache).await;

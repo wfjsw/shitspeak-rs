@@ -160,16 +160,19 @@ impl ClientProjectionState {
 
     /// Re-send the raw name of every channel this client can see whose
     /// translation changed. The connection writer translates names on the
-    /// way out, so the client ends up with the current translation.
+    /// way out, so the client ends up with the current translation. Clients
+    /// holding `no_channel_name_translation` always see the raw names, so a
+    /// translation change never reaches them.
     fn append_channel_name_refresh(
         &self,
         server: &Arc<Box<Server>>,
         change: &crate::localization::channel_names::ChannelNamesChanged,
         outbound: &mut Vec<Message>,
     ) {
-        if !server
-            .channel_name_translations()
-            .affects(change.diff(), &self.client.language())
+        if !self.client.sees_translated_channel_names()
+            || !server
+                .channel_name_translations()
+                .affects(change.diff(), &self.client.language())
         {
             return;
         }
@@ -893,12 +896,12 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                     crate::localization::channel_names::ChannelNameRefresh::Translations(
                         change,
                     ) => self.append_channel_name_refresh(&server, change, &mut outbound),
-                    crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(
-                        instance,
-                    ) if *instance == self.client.client_instance_id() => {
+                    crate::localization::channel_names::ChannelNameRefresh::ClientNames(instance)
+                        if *instance == self.client.client_instance_id() =>
+                    {
                         self.append_all_channel_names(&server, &mut outbound).await;
                     }
-                    crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(_) => {}
+                    crate::localization::channel_names::ChannelNameRefresh::ClientNames(_) => {}
                 },
                 ClientProjectionEvent::ClientLagged(_)
                 | ClientProjectionEvent::ChannelLagged(_) => {}

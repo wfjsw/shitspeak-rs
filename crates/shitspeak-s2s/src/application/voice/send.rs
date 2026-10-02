@@ -15,6 +15,7 @@ use crate::application::error::ApplicationError;
 use crate::application::proto::{
     self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_SERVICE_TAG, VoiceIntent, VoicePathFeedback,
 };
+use crate::application::voice::capability::{self, PeerCapabilityCache};
 use crate::application::voice::fec::{FecParityPath, FecSendOutcome};
 use crate::application::voice::{fec::FecSenderState, metrics};
 use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
@@ -262,6 +263,14 @@ pub trait VoiceTransport: Send + Sync + 'static {
         let _ = (group, dsts);
         Vec::new()
     }
+
+    /// Whether every node in `dsts` advertises sliding-window FEC parity, so
+    /// a stream to exactly those recipients may be coded with it. Test
+    /// transports default to `false`: the block code.
+    fn voice_fec_sliding_capable(&self, dsts: &[NodeIdentifier]) -> bool {
+        let _ = dsts;
+        false
+    }
 }
 
 /// Protect successfully sent proactive copies at the transport boundary. Originals are grouped by the foreground voice sender.
@@ -286,6 +295,7 @@ impl FecVoiceTransport {
                     cfg.voice_fec_parity_blocks,
                     cfg.voice_fec_interleave_depth,
                 )
+                .with_sliding_window(cfg.voice_fec_sliding_window)
             }),
             parity_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             shutdown,
@@ -326,7 +336,8 @@ impl FecVoiceTransport {
             .await?;
         if let (Some(sender), Some(frame), Some((first_hop, _))) = (&self.sender, frame, fec_route)
         {
-            let emissions = sender.push(
+            let sliding = sender.sliding_enabled() && self.inner.voice_fec_sliding_capable(&[dst]);
+            let emissions = sender.push_with_code(
                 first_hop,
                 &[dst],
                 frame.sender_session,
@@ -334,6 +345,7 @@ impl FecVoiceTransport {
                 frame.s2s_seq,
                 frame.payload,
                 frame.is_terminator,
+                sliding,
             );
             if emissions.is_empty() || self.inner.datagram_lane_shedding(first_hop) {
                 return Ok(());
@@ -500,11 +512,25 @@ impl VoiceTransport for FecVoiceTransport {
     ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
         self.inner.voice_tree_parity_detours(group, dsts)
     }
+
+    fn voice_fec_sliding_capable(&self, dsts: &[NodeIdentifier]) -> bool {
+        self.inner.voice_fec_sliding_capable(dsts)
+    }
 }
 
 /// Production `VoiceTransport` impl backed by the overlay network.
 pub struct OverlayVoiceTransport {
     pub overlay: OverlayNetwork,
+    peer_capabilities: PeerCapabilityCache,
+}
+
+impl OverlayVoiceTransport {
+    pub fn new(overlay: OverlayNetwork) -> Self {
+        Self {
+            overlay,
+            peer_capabilities: PeerCapabilityCache::default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -733,6 +759,17 @@ impl VoiceTransport for OverlayVoiceTransport {
         self.overlay
             .voice_tree_parity_detours(group.id(), group.version(), dsts)
     }
+
+    fn voice_fec_sliding_capable(&self, dsts: &[NodeIdentifier]) -> bool {
+        self.peer_capabilities.all_fec_sliding(dsts, |dst| {
+            capability::advertises_fec_sliding(
+                self.overlay
+                    .member(dst)
+                    .as_ref()
+                    .and_then(|member| member.upper_layer_capabilities()),
+            )
+        })
+    }
 }
 
 /// A voice envelope prepared for ordinary delivery and, if admitted, one
@@ -879,6 +916,7 @@ pub(crate) mod testing {
         route_quality_scalar_calls: AtomicU64,
         route_quality_batches: Mutex<Vec<Vec<NodeIdentifier>>>,
         tree_parity_detours: Mutex<HashMap<NodeIdentifier, NodeIdentifier>>,
+        fec_sliding_capable: Mutex<std::collections::HashSet<NodeIdentifier>>,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -922,7 +960,13 @@ pub(crate) mod testing {
                 route_quality_scalar_calls: AtomicU64::new(0),
                 route_quality_batches: Mutex::new(Vec::new()),
                 tree_parity_detours: Mutex::new(HashMap::new()),
+                fec_sliding_capable: Mutex::new(std::collections::HashSet::new()),
             })
+        }
+
+        /// Declare that `dst` advertises sliding-window FEC parity.
+        pub fn set_fec_sliding_capable(&self, dst: NodeIdentifier) {
+            self.fec_sliding_capable.lock().unwrap().insert(dst);
         }
 
         /// Declare that tree parity for `dst` has an independent route that
@@ -1072,6 +1116,11 @@ pub(crate) mod testing {
                 }
             }
             grouped
+        }
+
+        fn voice_fec_sliding_capable(&self, dsts: &[NodeIdentifier]) -> bool {
+            let capable = self.fec_sliding_capable.lock().unwrap();
+            !dsts.is_empty() && dsts.iter().all(|dst| capable.contains(dst))
         }
     }
 }

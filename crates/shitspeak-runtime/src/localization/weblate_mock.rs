@@ -29,6 +29,7 @@ struct MockState {
     page_size: Option<usize>,
     authorizations: Vec<Option<String>>,
     added_keys: Vec<String>,
+    add_failures: HashMap<String, u16>,
     unavailable: bool,
     requests: usize,
 }
@@ -153,6 +154,20 @@ impl MockWeblate {
 
     pub(crate) fn added_keys(&self) -> Vec<String> {
         self.state.lock().added_keys.clone()
+    }
+
+    /// Reject adds of `key` with `status` until [`Self::clear_add_failures`],
+    /// so a test can pin one name as unpushable and watch the others.
+    pub(crate) fn fail_add(&self, key: &str, status: u16) {
+        self.state
+            .lock()
+            .add_failures
+            .insert(key.to_owned(), status);
+    }
+
+    /// Accept every add again.
+    pub(crate) fn clear_add_failures(&self) {
+        self.state.lock().add_failures.clear();
     }
 
     pub(crate) fn source_keys(&self) -> Vec<String> {
@@ -303,6 +318,9 @@ fn respond(base: &str, state: &Mutex<MockState>, request: Request) -> (u16, Stri
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
             let key = body["key"].as_str().unwrap_or_default().to_owned();
             let value = body["value"][0].as_str().unwrap_or_default().to_owned();
+            if let Some(status) = state.add_failures.get(&key).copied() {
+                return (status, r#"{"detail":"add rejected"}"#.to_owned());
+            }
             let language_code = (*language_code).to_owned();
             let Some(translation) = state.translations.get_mut(&language_code) else {
                 return (404, r#"{"detail":"Not found."}"#.to_owned());

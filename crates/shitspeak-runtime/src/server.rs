@@ -666,16 +666,27 @@ impl Server {
         changed
     }
 
+    /// Re-send every visible channel name to one client (through its
+    /// projection, so ordering with channel updates is kept), after the way
+    /// names are presented to it changed: its language, or its
+    /// `no_channel_name_translation` entitlement.
+    pub(crate) fn refresh_client_channel_names(
+        self: &Arc<Box<Self>>,
+        client: &Arc<Box<Client>>,
+    ) {
+        self.publish_channel_name_refresh(
+            crate::localization::channel_names::ChannelNameRefresh::ClientNames(
+                client.client_instance_id(),
+            ),
+        );
+    }
+
     /// Re-send the localized state an authenticated client already holds
     /// after its language changed: every visible channel name (through its
     /// projection, so ordering with channel updates is kept) and the server
     /// context menu labels.
     pub(crate) async fn refresh_client_language(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) {
-        self.publish_channel_name_refresh(
-            crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(
-                client.client_instance_id(),
-            ),
-        );
+        self.refresh_client_channel_names(client);
         crate::toggle_superuser_visibility::refresh_context_menu(self, client).await;
     }
 
@@ -2047,6 +2058,7 @@ impl Server {
             }
         }
         let could_hide_self = client.can_hide_self();
+        let saw_translated_names = client.sees_translated_channel_names();
         {
             let mut state = client.write_global_state(&self.clients);
             state.set_user_id(user_id);
@@ -2063,8 +2075,16 @@ impl Server {
             // The authenticator chose a different language: re-send what the
             // client already holds in the old one.
             self.refresh_client_language(&client).await;
-        } else if could_hide_self != client.can_hide_self() {
-            crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
+        } else {
+            if saw_translated_names != client.sees_translated_channel_names() {
+                // The authenticator granted or revoked
+                // `no_channel_name_translation`: re-send every name so the
+                // client switches between the translations and the raw names.
+                self.refresh_client_channel_names(&client);
+            }
+            if could_hide_self != client.can_hide_self() {
+                crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
+            }
         }
 
         client.set_authentication_expiry(

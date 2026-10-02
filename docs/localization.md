@@ -109,7 +109,11 @@ The server keeps a Weblate component in sync with the channel tree:
 3. **Present**: every `ChannelState` sent to a client has its name replaced
    with the translation for the client's language. That covers the initial
    channel tree, renames, the root channel, and web gateway clients.
-   Untranslated names are sent as entered.
+   Untranslated names are sent as entered. A user holding the
+   `no_channel_name_translation` [privilege](authentication.md) is always sent
+   the names as entered, and is never re-sent names when a translation changes.
+   Gaining or losing the privilege re-sends every visible channel name, as a
+   language change does.
 4. **Update live**: when a translation changes, connected clients whose
    language is affected get the new name for every affected channel they can
    see. Channels hidden from a client are never sent to it.

@@ -328,11 +328,7 @@ impl super::channel_editor::EditorReplyTarget for LiveEditorReply<'_> {
     }
 
     fn displayed(&self, raw: &str) -> String {
-        let locale = self.sender.locale();
-        locale
-            .channel_names()
-            .translate(locale.language(), raw)
-            .unwrap_or_else(|| raw.to_owned())
+        self.sender.displayed_channel_name(raw)
     }
 
     async fn queue(&self, batch: Vec<Message>) -> Result<(), MessageHandlerError> {

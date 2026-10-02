@@ -4,6 +4,7 @@
 //! default, opt-in targeted mode, per-sender reorder buffer).
 
 pub(crate) mod budget;
+pub(crate) mod capability;
 pub(crate) mod fec;
 pub mod ingress;
 pub(crate) mod metrics;

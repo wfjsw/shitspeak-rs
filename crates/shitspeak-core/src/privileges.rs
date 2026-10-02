@@ -44,10 +44,13 @@ pub enum Privilege {
     /// Use the Hide me / Show me toggle, which hides this user from everyone
     /// except superusers and `see_all` viewers.
     HideSelf = 1 << 10,
+    /// Channel names are always supplied as entered, never translated into
+    /// this user's language.
+    NoChannelNameTranslation = 1 << 11,
 }
 
 impl Privilege {
-    pub const ALL: [Privilege; 11] = [
+    pub const ALL: [Privilege; 12] = [
         Privilege::SeeAll,
         Privilege::Suppress,
         Privilege::ServerModeration,
@@ -59,6 +62,7 @@ impl Privilege {
         Privilege::EditChannels,
         Privilege::TextMessage,
         Privilege::HideSelf,
+        Privilege::NoChannelNameTranslation,
     ];
 
     /// Stable name used by authenticators and replication.
@@ -75,6 +79,7 @@ impl Privilege {
             Privilege::EditChannels => "edit_channels",
             Privilege::TextMessage => "text_message",
             Privilege::HideSelf => "hide_self",
+            Privilege::NoChannelNameTranslation => "no_channel_name_translation",
         }
     }
 

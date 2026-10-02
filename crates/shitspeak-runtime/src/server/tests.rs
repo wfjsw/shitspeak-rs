@@ -1578,7 +1578,7 @@ async fn reauthentication_with_a_new_language_refreshes_localized_client_state()
         .expect("refresh channel open");
     assert!(matches!(
         refresh.as_ref(),
-        crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(instance)
+        crate::localization::channel_names::ChannelNameRefresh::ClientNames(instance)
             if *instance == client.client_instance_id()
     ));
     assert_eq!(client.language(), Language::parse("es").unwrap());
@@ -1620,6 +1620,139 @@ async fn gateway_egress_translates_channel_names_for_the_client_language() {
         };
         assert_eq!(state.name.as_deref(), Some(expected));
     }
+}
+
+#[tokio::test]
+async fn gateway_egress_supplies_raw_channel_names_with_no_channel_name_translation() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    server.channel_name_translations().replace(std::collections::HashMap::from([(
+        Language::parse("es").unwrap(),
+        std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
+    )]));
+    client
+        .write_global_state_direct()
+        .set_privileges(shitspeak_core::Privilege::NoChannelNameTranslation.into());
+    let lobby: Message = shitspeak_messages::messages::encoder::ChannelState {
+        channel_id: Some(4),
+        name: Some("Lobby".to_owned()),
+        ..Default::default()
+    }
+    .into();
+
+    for requested in [None, Language::parse("es-MX")] {
+        let label = format!("{requested:?}");
+        server.apply_client_language(&client, requested);
+        client.write_proto_message(&lobby).await.expect("write");
+        let Some(Message::ChannelState(state)) =
+            tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+                .await
+                .expect("outbound message")
+        else {
+            panic!("expected ChannelState");
+        };
+        assert_eq!(
+            state.name.as_deref(),
+            Some("Lobby"),
+            "no_channel_name_translation keeps the name as entered for {label}"
+        );
+    }
+}
+
+/// Gaining or losing `no_channel_name_translation` at reauthentication
+/// re-sends every channel name, since the names the client already holds are
+/// now shown the other way around.
+#[tokio::test]
+async fn reauthentication_flipping_no_channel_name_translation_refreshes_channel_names() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let mut refreshes = server.channel_names_tx.subscribe();
+    let (client, _outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    assert!(client.sees_translated_channel_names());
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Reauth,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            privileges: shitspeak_core::Privilege::NoChannelNameTranslation.into(),
+            virtual_server_id: None,
+            language: None,
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send reauthentication granting no_channel_name_translation");
+
+    let refresh = tokio::time::timeout(Duration::from_secs(1), refreshes.recv())
+        .await
+        .expect("channel-name refresh published when the privilege is granted")
+        .expect("refresh channel open");
+    assert!(
+        matches!(
+            refresh.as_ref(),
+            crate::localization::channel_names::ChannelNameRefresh::ClientNames(instance)
+                if *instance == client.client_instance_id()
+        ),
+        "granting no_channel_name_translation re-sends the names, got {refresh:?}"
+    );
+    assert!(!client.sees_translated_channel_names());
+
+    let next_deadline = deadline + chrono::Duration::hours(2);
+    set_expiring_authentication(&client, next_deadline, AuthenticationExpiryAction::Reauth);
+    authentication_expiry_reaper(&server, next_deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("second reauthentication started")
+        .expect("second reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(next_deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            privileges: Default::default(),
+            virtual_server_id: None,
+            language: None,
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send reauthentication revoking no_channel_name_translation");
+
+    let refresh = tokio::time::timeout(Duration::from_secs(1), refreshes.recv())
+        .await
+        .expect("channel-name refresh published when the privilege is revoked")
+        .expect("refresh channel open");
+    assert!(
+        matches!(
+            refresh.as_ref(),
+            crate::localization::channel_names::ChannelNameRefresh::ClientNames(instance)
+                if *instance == client.client_instance_id()
+        ),
+        "revoking no_channel_name_translation re-sends the names, got {refresh:?}"
+    );
+    assert!(client.sees_translated_channel_names());
 }
 
 #[tokio::test]

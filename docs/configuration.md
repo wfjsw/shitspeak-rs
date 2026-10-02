@@ -786,6 +786,13 @@ reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
 reorder_idle_reset_ms = 2000
 reorder_disabled = false
+# How long after a deadline flush released past a missing sequence the earliest
+# surviving copy of it may still emit, out of order (0 through 200). Whichever
+# copy kind arrives first fills the hole; 0 disables late fills. A default
+# Mumble client plays a 10 ms margin on top of a delay it adapts to the jitter
+# it observes, so a fill lands in time on a clean edge only within ~10 ms of
+# the release, and somewhat later on a jittery one.
+voice_late_fill_window_ms = 40
 adaptive_jitter_enabled = true
 adaptive_jitter_min_delay_ms = 40
 adaptive_jitter_max_delay_ms = 120
@@ -814,6 +821,10 @@ voice_fec_block_size = 3
 voice_fec_parity_blocks = 3
 voice_fec_interleave_depth = 2
 voice_fec_receiver_window = 32
+# Toward recipients that all advertise it, every data frame is followed at once
+# by one sliding-window parity over the last this-many frames instead of block
+# parity. 0, or 2 through 16; 0 stops sending and advertising it.
+voice_fec_sliding_window = 4
 
 [s2s.overlay]
 hello_interval_ms = 1000
@@ -1120,6 +1131,35 @@ all of its frames, whatever their lengths. An utterance terminator flushes
 partial blocks. With the defaults the parity overhead is 100% of voice
 frames.
 
+A block member can only be rebuilt once its block completes, up to
+`(voice_fec_block_size - 1) × voice_fec_interleave_depth` frames (80 ms with
+the defaults) after it was due. The receiver releases past a missing frame
+about one packet duration after it was due, so most block recoveries arrive
+as late fills. Sliding-window parity removes that wait. Each protectable data
+frame is followed at once by one parity equation over the last
+`voice_fec_sliding_window` frames (4 by default), and the receiver solves
+overlapping equations jointly. A single loss is rebuilt as soon as the parity
+sent with the lost frame arrives, before the release. A burst is rebuilt
+whatever its length while the parity sent with each lost frame survives,
+which is the usual case when parity rides an independent path. If a burst
+takes its parity as well, up to `voice_fec_sliding_window - 1` frames are
+rebuilt from the equations that follow. After a terminator,
+`voice_fec_sliding_window - 1` more equations over the final window follow at
+20 ms intervals. The overhead is one parity frame per data frame, like the
+default block shape. Sliding parity uses wire indices 64 and up, which
+receivers without it ignore.
+
+A sender codes a stream with sliding-window parity only when every recipient
+of that stream advertises it. Each node publishes that in its LSA, under the
+voice entry of the upper-layer capability envelope. It does so whenever FEC is
+enabled and `voice_fec_sliding_window` is at least 2. Streams to any other
+recipient set keep the block code, so mixed-version fleets keep working.
+Setting `voice_fec_sliding_window = 0` withdraws the advertisement, so peers
+stop sending sliding parity to this node, and makes this node send only block
+parity. Voice merges its entry into an envelope that replication has already
+published and never creates the envelope itself. A node whose envelope is
+absent therefore advertises no sliding support.
+
 Parity follows the data's own route, so listeners receive data and parity at
 the same latency. With `tree_delivery_enabled`, parity is sent into the same
 distribution tree, group, and recipients as the voice, and every tree edge
@@ -1160,16 +1200,38 @@ thing that skips parity is a first hop whose datagram lane is shedding frames
 at the send path; parity bound for the alternate is unaffected by the
 primary's shedding. The cadence deadline above still applies to recovery. If a
 frame is reconstructed after the receiver has already released past its
-sequence, it is delivered once, out of order, for up to 200 ms. Listener
-jitter buffers re-sequence it by the Mumble packet sequence or discard it.
+sequence, the earliest surviving copy of that sequence — whichever kind it is —
+is delivered once, out of order, within `voice_late_fill_window_ms` (default
+40 ms). Listener jitter buffers re-sequence it by the Mumble packet sequence or
+discard it. A default Mumble client plays a 10 ms margin on top of a delay it
+adapts to the arrival jitter it sees, so on a clean edge only the `le_10` band
+after the release is audible; on a jittery edge the client's deeper buffer
+also admits some of `le_20` and `le_40`. A late fill is
+reported as `result="late_fill"` with a `copy` label naming the copy kind that
+won the race; later copies of the same sequence become
+`reason="delivered_<winner>"`.
 `shitspeak_s2s_voice_fec_recovered_frames_total{outcome}` counts
-reconstructions that arrived `in_time`, `late`, or were `discarded`.
-`shitspeak_s2s_voice_late_arrival_after_release_bucket_total{copy,bucket}`
+reconstructions that arrived `in_time`, `late`, or were `discarded` — a
+reconstruction that lost the race to a late-filling copy is `discarded`, since
+that hole was already filled.
+`shitspeak_s2s_voice_late_arrival_after_release_bucket_total{origin_node,copy,bucket}`
 counts every copy (`original`, `proactive`, `fec`, `repair`) that arrived for a
 sequence the receiver had already released past, bucketed by milliseconds
 after the release (`le_10` … `gt_640`). It shows how much of the loss a longer
 receiver wait or a deeper client jitter buffer could still have recovered. The
-receiver remembers the last 64 released sequences per speaker. Parity
+receiver remembers the last 64 released sequences per speaker.
+
+Per released hole rather than per copy:
+`shitspeak_s2s_voice_released_holes_total{origin_node}` counts every sequence a
+deadline flush released past, exactly once, and
+`shitspeak_s2s_voice_released_gap_runs_total{origin_node,missing_frames}`
+buckets those releases by run length. Released holes minus
+`receive_events{result="late_fill"}` is the audio no copy recovered.
+`shitspeak_s2s_voice_released_hole_first_copy_bucket_total{origin_node,copy,bucket}`
+records only the first copy of any kind to reach each hole, so released holes
+minus its total is the number of holes no copy reached at all, and its buckets
+are the earliest any listener could have had the frame.
+`shitspeak_s2s_voice_fec_recovered_frames_total` also carries `origin_node`. Parity
 wire indices start at 2. Peers built before this scheme use indices 0 and 1
 and ignore these frames, and this build ignores theirs, so mixed versions
 fall back to no FEC between them and never mis-decode each other's parity.
@@ -1218,9 +1280,11 @@ the kind of copy that arrived: `original`, `proactive`, `fec`, or `repair`.
 - `delivered_original`, `delivered_proactive`, `delivered_fec`,
   `delivered_repair`: the sequence was already delivered, by that kind of copy.
   For example, an original with `reason="delivered_fec"` lost the race to a FEC
-  reconstruction.
+  reconstruction — or to a FEC copy that late-filled a released hole first.
 - `late_after_release`: the frame arrived after a deadline flush released past
-  its sequence, so listeners never heard it.
+  its sequence, and outside `voice_late_fill_window_ms` (or as a terminator),
+  so it was not emitted. A default client keeps only a 10 ms margin plus its
+  learned jitter delay, so a copy this late is past its playout point.
 - `already_buffered`: an equal or better copy was already waiting.
 - `repair_without_gap`, `repair_without_stream`: a repair copy (overlay tree
   repair, or an older peer's reactive repair) arrived with no open gap, or for
@@ -1230,8 +1294,14 @@ the kind of copy that arrived: `original`, `proactive`, `fec`, or `repair`.
 - `untracked`: the sequence is below the cursor and older than the last 128
   deliveries.
 
-Only `late_after_release` is audio the listener missed. The other reasons are
-redundancy or protocol noise.
+A copy that is accepted into a released hole instead reports
+`result="late_fill"` with its `copy` label, not `duplicate_or_late`.
+
+Of the rejection reasons, `late_after_release` is the audio a listener missed
+at default settings. Late fills are audible only while they land within the
+client's 10 ms margin plus its learned jitter delay — on a clean edge, the
+`le_10` band of `shitspeak_s2s_voice_late_arrival_after_release_bucket_total`. The other reasons are redundancy or
+protocol noise.
 
 The allocator exports conserved credit lifecycle bytes through
 `shitspeak_s2s_voice_repair_credit_bytes_total{stage}`, and proactive
