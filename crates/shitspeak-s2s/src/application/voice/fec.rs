@@ -424,6 +424,11 @@ impl SlidingParityToSend {
 }
 
 fn encode_sliding(window: &VecDeque<PendingMember>, step: u32) -> SlidingParityToSend {
+    // Members are coded in seq order, whatever order they were pushed in
+    // (proactive copies leave a queue out of order): the equation's identity
+    // is its newest seq, which is all the receiver can derive from the wire.
+    let mut window: Vec<&PendingMember> = window.iter().collect();
+    window.sort_unstable_by_key(|member| member.seq);
     let member_seqs: Vec<u64> = window.iter().map(|member| member.seq).collect();
     let parity_id = sliding_parity_id(member_seqs.last().copied().unwrap_or(0), step);
     let symbol_len = LENGTH_PREFIX
@@ -2327,5 +2332,46 @@ pub(crate) mod tests {
             lose,
         );
         assert!(sliding <= block, "sliding {sliding} vs block {block}");
+    }
+
+    /// Frames can reach the sender out of order — proactive copies are sent
+    /// from a queue. The equation's coefficients must not depend on push
+    /// order: the receiver only sees the member seqs, so a sender keyed on
+    /// the last-pushed member and a receiver keyed on the newest seq would
+    /// disagree and rebuild garbage.
+    #[test]
+    fn sliding_parity_survives_out_of_order_pushes() {
+        let sender = sliding_sender(4);
+        let receiver = ReceiverFecState::new(32);
+        let mut equations = Vec::new();
+        for seq in [0u64, 1, 3, 2] {
+            for emission in sender.push_with_code(
+                3,
+                &[9],
+                7,
+                11,
+                seq,
+                Bytes::from(payload_for(seq)),
+                false,
+                true,
+            ) {
+                equations.push(proto::decode_voice(&emission.encode(7, 11).unwrap()).unwrap());
+            }
+            if seq != 2 {
+                receiver.record_frame(frame(seq, &payload_for(seq), false));
+            }
+        }
+        // Only the equation sent with 2, the last one pushed, covers 2 alone
+        // among unknowns.
+        let last = equations.last().unwrap();
+        assert!(receiver.record_parity(
+            7,
+            11,
+            last.fec_member_seqs.clone(),
+            last.payload.clone(),
+            last.fec_parity_index,
+            last.fec_terminator_mask,
+        ));
+        assert_eq!(recovered_seqs(&receiver), vec![2]);
     }
 }

@@ -997,17 +997,68 @@ async fn dial_resolved_seed_address(
     Ok(node)
 }
 
-fn resolve_seed_address(seed: &SeedAddress) -> io::Result<Vec<PeerAddress>> {
-    resolve_seed_address_with_capability(seed, LocalIpCapability::discover())
+/// How long resolving a seed's host name may take before the probe gives up.
+/// A dead resolver then costs one failed probe, retried on the seed's backoff.
+const SEED_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The system resolver: a blocking `getaddrinfo`.
+fn system_lookup(addr: String) -> io::Result<Vec<SocketAddr>> {
+    Ok(addr.to_socket_addrs()?.collect())
 }
 
-fn resolve_seed_address_with_capability(
+async fn resolve_seed_address(seed: &SeedAddress) -> io::Result<Vec<PeerAddress>> {
+    resolve_seed_address_with(
+        seed,
+        LocalIpCapability::discover(),
+        SEED_RESOLVE_TIMEOUT,
+        system_lookup,
+    )
+    .await
+}
+
+/// Resolve a seed with `lookup` on the blocking pool, never on the runtime: a
+/// host-name lookup is a blocking `getaddrinfo`, and against a dead resolver
+/// each one waits out the resolver's own timeouts. Run inline it froze a
+/// transport worker for that long — on a single-core node, long enough for
+/// the S2S UDP socket buffer to overflow and drop a burst of voice. A lookup
+/// still running at `timeout` fails the probe; its blocking thread finishes
+/// on its own.
+async fn resolve_seed_address_with(
     seed: &SeedAddress,
+    local_ip_capability: LocalIpCapability,
+    timeout: Duration,
+    lookup: impl FnOnce(String) -> io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> io::Result<Vec<PeerAddress>> {
+    let host = seed.addr().to_owned();
+    let resolved = match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || lookup(host)),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved?,
+        Ok(Err(join_error)) => return Err(io::Error::other(join_error)),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "resolving seed address {:?} took longer than {timeout:?}",
+                    seed.addr()
+                ),
+            ));
+        }
+    };
+    seed_peer_addresses(seed, resolved, local_ip_capability)
+}
+
+fn seed_peer_addresses(
+    seed: &SeedAddress,
+    resolved: Vec<SocketAddr>,
     local_ip_capability: LocalIpCapability,
 ) -> io::Result<Vec<PeerAddress>> {
     let mut addrs = Vec::new();
     let mut seen = HashSet::new();
-    for addr in seed.addr().to_socket_addrs()? {
+    for addr in resolved {
         if !local_ip_capability.supports_remote(addr.ip()) {
             debug!(
                 %addr,
@@ -1037,7 +1088,7 @@ pub(crate) async fn dial_seed_address(
     inner: &Arc<ManagerInner>,
     seed: &SeedAddress,
 ) -> io::Result<NodeIdentifier> {
-    let resolved_addrs = resolve_seed_address(seed)?;
+    let resolved_addrs = resolve_seed_address(seed).await?;
     let mut self_addrs = Vec::new();
     let addrs: Vec<_> = resolved_addrs
         .into_iter()
@@ -1439,16 +1490,91 @@ mod tests {
         assert!(address_dial_allowed(&peer, udp));
     }
 
-    #[test]
-    fn seed_resolution_skips_ipv6_without_local_ipv6() {
+    /// A seed host name resolves off the runtime. A resolver that stalls
+    /// (dead upstream DNS: every query waits out its timeout) must not stall
+    /// the transport runtime with it — on a single-core node that runtime is
+    /// also what drains the S2S UDP socket.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_seed_lookup_does_not_block_the_runtime() {
+        let seed = SeedAddress::new("seed.example:64801".to_string(), TransportKind::Tcp);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let resolved = resolve_seed_address_with(
+            &seed,
+            LocalIpCapability { has_ipv6: false },
+            Duration::from_secs(5),
+            |_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(vec!["192.0.2.7:64801".parse().unwrap()])
+            },
+        )
+        .await
+        .expect("a slow lookup still resolves");
+        ticker.abort();
+        assert_eq!(
+            resolved,
+            vec![PeerAddress::new(
+                "192.0.2.7:64801".parse().unwrap(),
+                TransportKind::Tcp
+            )]
+        );
+        // The runtime kept running other tasks for the whole lookup.
+        let ticked = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ticked >= 10,
+            "runtime stalled during the lookup: {ticked} ticks"
+        );
+    }
+
+    /// A lookup that never answers in time fails the probe instead of
+    /// holding it.
+    #[tokio::test]
+    async fn a_seed_lookup_that_outlives_its_timeout_fails_the_probe() {
+        let seed = SeedAddress::new("seed.example:64801".to_string(), TransportKind::Tcp);
+        let started = std::time::Instant::now();
+        let error = resolve_seed_address_with(
+            &seed,
+            LocalIpCapability { has_ipv6: false },
+            Duration::from_millis(100),
+            |_| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(vec!["192.0.2.7:64801".parse().unwrap()])
+            },
+        )
+        .await
+        .expect_err("the lookup outlived its timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn seed_resolution_skips_ipv6_without_local_ipv6() {
         let seed = SeedAddress::new("[fd00::12]:64739".to_string(), TransportKind::Tcp);
-        let err =
-            resolve_seed_address_with_capability(&seed, LocalIpCapability { has_ipv6: false })
-                .expect_err("IPv6 seed is not usable on an IPv4-only host");
+        let resolve = |has_ipv6| {
+            resolve_seed_address_with(
+                &seed,
+                LocalIpCapability { has_ipv6 },
+                SEED_RESOLVE_TIMEOUT,
+                system_lookup,
+            )
+        };
+        let err = resolve(false)
+            .await
+            .expect_err("IPv6 seed is not usable on an IPv4-only host");
 
         assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
         assert_eq!(
-            resolve_seed_address_with_capability(&seed, LocalIpCapability { has_ipv6: true })
+            resolve(true)
+                .await
                 .expect("IPv6 seed remains usable when local IPv6 exists"),
             vec![PeerAddress::new(
                 "[fd00::12]:64739".parse().unwrap(),
