@@ -7,7 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use prost::Message as _;
@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 use super::super::adaptive_queue::AdaptiveQueueBudget;
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState, QuicV2SessionSender};
+use super::super::duplicate_identity::DuplicateIdentityEvidence;
 use super::super::frame::{FrameType, build_frame, encode_frame_to_bytes};
 use super::super::identity::parse_peer_cn;
 use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError};
@@ -40,8 +41,9 @@ use super::super::stream_io::{
     StreamLanePolicy, StreamPumpConfig, spawn_stream_lane_pump, stream_handoff_lane_bytes,
 };
 use super::{
-    Endpoint, install_stream_session,
+    Endpoint, classify_dialed_self_loop, inbound_identity_conflict, install_stream_session,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxSet},
+    quic_self_loop_exporter, reject_accepted_self_loop, reject_duplicate_identity_quic,
 };
 
 pub(crate) const QUIC_ALPN_V1: &[u8] = b"s2s/1";
@@ -57,6 +59,9 @@ const QUIC_V2_LANE_RESERVED: u8 = 0;
 pub(crate) const QUIC_CLOSE_SETUP_PROTOCOL: u32 = 0x100;
 pub(crate) const QUIC_CLOSE_REQUIRED_LANE_FAILED: u32 = 0x101;
 pub(crate) const QUIC_CLOSE_LOCAL_SHUTDOWN: u32 = 0x102;
+/// Acceptor refused the session: the dialer's node id is held by a live
+/// session from a known endpoint and the dialer came from a new one.
+pub(crate) const QUIC_CLOSE_DUPLICATE_NODE: u32 = 0x103;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuicProtocolVersion {
@@ -490,6 +495,7 @@ impl Endpoint for QuicEndpoint {
         peer: Arc<PeerState>,
         addr: SocketAddr,
     ) -> io::Result<()> {
+        let dial_started_at = Instant::now();
         let connecting = self
             .client_handle(addr)
             .await?
@@ -511,6 +517,12 @@ impl Endpoint for QuicEndpoint {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity"))?;
         let peer_node = parse_peer_cn(&chain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node == inner.self_id() {
+            let exporter = quic_self_loop_exporter(&conn);
+            return Err(
+                classify_dialed_self_loop(&inner, TransportKind::Quic, addr, exporter).await,
+            );
+        }
         if peer_node != peer.node_id() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -522,7 +534,16 @@ impl Endpoint for QuicEndpoint {
         }
         let protocol = negotiated_quic_protocol_or_close(&conn)?;
         record_quic_negotiation(protocol, QuicProtocolResult::Success);
-        install_quic_connection(&inner, peer_node, Some(addr), true, conn, protocol).await?;
+        install_quic_connection(
+            &inner,
+            peer_node,
+            Some(addr),
+            true,
+            Some(dial_started_at),
+            conn,
+            protocol,
+        )
+        .await?;
         Ok(())
     }
 
@@ -531,6 +552,7 @@ impl Endpoint for QuicEndpoint {
         inner: Arc<ManagerInner>,
         addr: SocketAddr,
     ) -> io::Result<crate::types::NodeIdentifier> {
+        let dial_started_at = Instant::now();
         let connecting = self
             .client_handle(addr)
             .await?
@@ -549,14 +571,23 @@ impl Endpoint for QuicEndpoint {
         let peer_node = parse_peer_cn(&chain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
         if peer_node == inner.self_id() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "self-loop rejected",
-            ));
+            let exporter = quic_self_loop_exporter(&conn);
+            return Err(
+                classify_dialed_self_loop(&inner, TransportKind::Quic, addr, exporter).await,
+            );
         }
         let protocol = negotiated_quic_protocol_or_close(&conn)?;
         record_quic_negotiation(protocol, QuicProtocolResult::Success);
-        install_quic_connection(&inner, peer_node, Some(addr), true, conn, protocol).await?;
+        install_quic_connection(
+            &inner,
+            peer_node,
+            Some(addr),
+            true,
+            Some(dial_started_at),
+            conn,
+            protocol,
+        )
+        .await?;
         Ok(peer_node)
     }
 }
@@ -607,9 +638,19 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
     let peer_node = parse_peer_cn(&chain)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if peer_node == inner.self_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "self-loop rejected",
+        return Err(reject_accepted_self_loop(
+            &inner,
+            quic_self_loop_exporter(&conn),
+        ));
+    }
+    if let Some(conflict) =
+        inbound_identity_conflict(&inner, peer_node, TransportKind::Quic, remote_addr)
+    {
+        return Err(reject_duplicate_identity_quic(
+            &conn,
+            peer_node,
+            remote_addr,
+            conflict,
         ));
     }
     inner
@@ -617,8 +658,37 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
         .note_observed_remote_addr(TransportKind::Quic, remote_addr);
     let protocol = negotiated_quic_protocol_or_close(&conn)?;
     record_quic_negotiation(protocol, QuicProtocolResult::Success);
-    install_quic_connection(&inner, peer_node, Some(remote_addr), false, conn, protocol).await?;
+    install_quic_connection(&inner, peer_node, Some(remote_addr), false, None, conn, protocol).await?;
     Ok(())
+}
+
+/// Report a peer's duplicate-identity refusal of a session we dialed. Must
+/// run before any local close: that replaces the peer's close reason.
+fn report_duplicate_identity_close(
+    inner: &ManagerInner,
+    conn: &quinn::Connection,
+    peer_node: crate::types::NodeIdentifier,
+    remote_addr: Option<SocketAddr>,
+    is_dialer: bool,
+    dial_started_at: Option<Instant>,
+) {
+    if is_dialer
+        && let Some(quinn::ConnectionError::ApplicationClosed(close)) = conn.close_reason()
+        && close.error_code == quinn::VarInt::from_u32(QUIC_CLOSE_DUPLICATE_NODE)
+    {
+        let attestation = dial_started_at.and_then(|not_before| {
+            super::super::duplicate_identity::decode_attestation(close.reason.as_ref(), not_before)
+        });
+        inner
+            .inbound()
+            .duplicate_identity()
+            .report(DuplicateIdentityEvidence::rejected_by_peer(
+                TransportKind::Quic,
+                remote_addr,
+                peer_node,
+            )
+            .with_attestation(attestation));
+    }
 }
 
 fn record_quic_negotiation(protocol: QuicProtocolVersion, result: QuicProtocolResult) {
@@ -634,6 +704,7 @@ async fn install_quic_connection(
     peer_node: crate::types::NodeIdentifier,
     remote_addr: Option<SocketAddr>,
     is_dialer: bool,
+    dial_started_at: Option<Instant>,
     conn: quinn::Connection,
     protocol: QuicProtocolVersion,
 ) -> io::Result<()> {
@@ -652,6 +723,14 @@ async fn install_quic_connection(
             let (send, recv) = match stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
+                    report_duplicate_identity_close(
+                        inner,
+                        &conn,
+                        peer_node,
+                        remote_addr,
+                        is_dialer,
+                        dial_started_at,
+                    );
                     record_quic_protocol_event(
                         QuicProtocolStage::Setup,
                         MetricQuicProtocolVersion::S2s1,
@@ -666,6 +745,7 @@ async fn install_quic_connection(
                 TransportKind::Quic,
                 remote_addr,
                 is_dialer,
+                dial_started_at,
                 BiStream { send, recv },
                 native_sampler,
             );
@@ -677,7 +757,8 @@ async fn install_quic_connection(
             Ok(())
         }
         QuicProtocolVersion::V2 => {
-            install_quic_v2_session(inner, peer_node, remote_addr, is_dialer, conn).await
+            install_quic_v2_session(inner, peer_node, remote_addr, is_dialer, dial_started_at, conn)
+                .await
         }
     }
 }
@@ -737,6 +818,7 @@ async fn install_quic_v2_session(
     peer_node: crate::types::NodeIdentifier,
     remote_addr: Option<SocketAddr>,
     is_dialer: bool,
+    dial_started_at: Option<Instant>,
     conn: quinn::Connection,
 ) -> io::Result<()> {
     if inner.cfg().quic_datagram_send_buffer_bytes() == 0
@@ -776,6 +858,14 @@ async fn install_quic_v2_session(
         {
             Ok(lanes) => lanes,
             Err(error) => {
+                report_duplicate_identity_close(
+                        inner,
+                        &conn,
+                        peer_node,
+                        remote_addr,
+                        is_dialer,
+                        dial_started_at,
+                    );
                 record_quic_setup_error(&error);
                 record_quic_protocol_event(
                     QuicProtocolStage::Setup,

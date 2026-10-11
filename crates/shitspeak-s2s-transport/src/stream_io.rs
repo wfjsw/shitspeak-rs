@@ -40,6 +40,7 @@ use super::compression::{
     train_adaptive_dictionary, validate_and_decode_payload_with_dictionary,
 };
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
+use super::duplicate_identity::DuplicateIdentityEvidence;
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
 use super::metrics::{
@@ -141,6 +142,10 @@ pub(crate) struct StreamPumpConfig {
     max_pending_pings: usize,
     quic_v2_lane: Option<MessageClass>,
     quic_v2_close_code: Option<Arc<AtomicU32>>,
+    /// When a dialer started this connection. A peer's liveness statement
+    /// is bounded by it: the peer answered after this instant, so the
+    /// observation it reports cannot be older than this minus its age.
+    dial_started_at: Option<Instant>,
 }
 
 impl StreamPumpConfig {
@@ -173,7 +178,13 @@ impl StreamPumpConfig {
             max_pending_pings,
             quic_v2_lane: None,
             quic_v2_close_code: None,
+            dial_started_at: None,
         }
+    }
+
+    pub(crate) fn with_dial_started_at(mut self, started: Option<Instant>) -> Self {
+        self.dial_started_at = started;
+        self
     }
 
     pub(crate) fn with_quic_v2_close_code(mut self, close_code: Arc<AtomicU32>) -> Self {
@@ -1385,6 +1396,7 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameBye) => "transport.tcp.frame.bye",
             Ok(pb::FrameType::FrameDictionary) => "transport.tcp.frame.dictionary",
             Ok(pb::FrameType::FrameDictionaryAck) => "transport.tcp.frame.dictionary_ack",
+            Ok(pb::FrameType::FrameDuplicateNode) => "transport.tcp.frame.duplicate_node",
             Err(_) => "transport.tcp.frame.unknown",
         },
         TransportKind::Kcp => match pb::FrameType::try_from(frame_type) {
@@ -1396,6 +1408,7 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameBye) => "transport.kcp.frame.bye",
             Ok(pb::FrameType::FrameDictionary) => "transport.kcp.frame.dictionary",
             Ok(pb::FrameType::FrameDictionaryAck) => "transport.kcp.frame.dictionary_ack",
+            Ok(pb::FrameType::FrameDuplicateNode) => "transport.kcp.frame.duplicate_node",
             Err(_) => "transport.kcp.frame.unknown",
         },
         TransportKind::Quic => match pb::FrameType::try_from(frame_type) {
@@ -1407,6 +1420,7 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameBye) => "transport.quic.frame.bye",
             Ok(pb::FrameType::FrameDictionary) => "transport.quic.frame.dictionary",
             Ok(pb::FrameType::FrameDictionaryAck) => "transport.quic.frame.dictionary_ack",
+            Ok(pb::FrameType::FrameDuplicateNode) => "transport.quic.frame.duplicate_node",
             Err(_) => "transport.quic.frame.unknown",
         },
         TransportKind::Udp => match pb::FrameType::try_from(frame_type) {
@@ -1418,6 +1432,7 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameBye) => "transport.udp.stream_frame.bye",
             Ok(pb::FrameType::FrameDictionary) => "transport.udp.stream_frame.dictionary",
             Ok(pb::FrameType::FrameDictionaryAck) => "transport.udp.stream_frame.dictionary_ack",
+            Ok(pb::FrameType::FrameDuplicateNode) => "transport.udp.stream_frame.duplicate_node",
             Err(_) => "transport.udp.stream_frame.unknown",
         },
     }
@@ -1650,6 +1665,32 @@ where
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "peer sent BYE",
+            ));
+        }
+        pb::FrameType::FrameDuplicateNode => {
+            if !policy.owns_session_control {
+                cfg.mark_protocol_violation();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session-control frame received outside the Control lane",
+                ));
+            }
+            let attestation = cfg
+                .dial_started_at
+                .and_then(|not_before| {
+                    crate::duplicate_identity::decode_attestation(frame.payload.as_ref(), not_before)
+                });
+            inbound
+                .duplicate_identity()
+                .report(DuplicateIdentityEvidence::rejected_by_peer(
+                    cfg.transport,
+                    None,
+                    cfg.peer_node,
+                )
+                .with_attestation(attestation));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer rejected this node id: a live session from a known endpoint holds it",
             ));
         }
     }

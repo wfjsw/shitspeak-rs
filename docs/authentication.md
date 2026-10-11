@@ -138,6 +138,7 @@ Successful authentication can provide identity, display name, groups, privileges
 | `text_message` | Send text messages to any visible user, channel, or channel tree regardless of the ACL. |
 | `hide_self` | Offers the Hide me / Show me server context action. Hidden mode hides the user from everyone except superusers and `see_all` viewers, keeps them suppressed, and delivers their text as server messages. Superusers can always use it. Losing the privilege (or superuser status) ends hidden mode. |
 | `no_channel_name_translation` | Channel names are always supplied as entered, never translated into this user's language. Applies to the channel tree, renames, and the channel editor. A reauthentication that grants or revokes the privilege re-sends every visible channel name. |
+| `promiscuous` | Receives every voice packet routed in the user's virtual server on any cluster node, whatever its channel, listener, whisper, or shout target, as listen audio. Voice the user already receives normally is not duplicated. Senders the user cannot see stay inaudible, and deafening still silences everything. Voice the server drops (muted or suppressed senders, whispers with no permitted target) is not forwarded. |
 
 Permissions reported to the client (`ServerSync` and `PermissionQuery`) include the ACL bits matching the user's privileges, so standard clients enable the corresponding actions. The server still enforces each privilege on its own. For example, `edit_channels` reports `Write`, but channel removal and ACL edits are still rejected without an ACL grant.
 

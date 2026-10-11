@@ -70,10 +70,15 @@ impl RecipientIndexKey {
 /// Full recipient-index snapshot used by the runtime refresh bridge.
 pub type RecipientIndexSnapshot = HashMap<RecipientIndexKey, BTreeSet<NodeIdentifier>>;
 
+/// server-id → nodes hosting at least one client that receives every voice
+/// packet in that server, whatever its channel or target.
+pub type PromiscuousNodes = HashMap<String, BTreeSet<NodeIdentifier>>;
+
 pub struct RecipientIndexUpdate {
     snapshot: RecipientIndexSnapshot,
     complete_servers: BTreeSet<String>,
     covered_nodes: BTreeSet<NodeIdentifier>,
+    promiscuous_nodes: PromiscuousNodes,
 }
 
 impl RecipientIndexUpdate {
@@ -86,7 +91,15 @@ impl RecipientIndexUpdate {
             snapshot,
             complete_servers,
             covered_nodes,
+            promiscuous_nodes: PromiscuousNodes::new(),
         }
+    }
+
+    /// Nodes that must receive every voice frame of a server in addition to
+    /// the channel-derived destinations.
+    pub fn with_promiscuous_nodes(mut self, promiscuous_nodes: PromiscuousNodes) -> Self {
+        self.promiscuous_nodes = promiscuous_nodes;
+        self
     }
 
     fn into_parts(
@@ -95,8 +108,14 @@ impl RecipientIndexUpdate {
         RecipientIndexSnapshot,
         BTreeSet<String>,
         BTreeSet<NodeIdentifier>,
+        PromiscuousNodes,
     ) {
-        (self.snapshot, self.complete_servers, self.covered_nodes)
+        (
+            self.snapshot,
+            self.complete_servers,
+            self.covered_nodes,
+            self.promiscuous_nodes,
+        )
     }
 
     pub fn snapshot(&self) -> &RecipientIndexSnapshot {
@@ -109,6 +128,10 @@ impl RecipientIndexUpdate {
 
     pub fn covered_nodes(&self) -> &BTreeSet<NodeIdentifier> {
         &self.covered_nodes
+    }
+
+    pub fn promiscuous_nodes(&self) -> &PromiscuousNodes {
+        &self.promiscuous_nodes
     }
 }
 
@@ -192,6 +215,7 @@ pub struct RecipientIndex {
     nodes_by_server: Arc<RwLock<HashMap<String, BTreeSet<NodeIdentifier>>>>,
     complete_servers: Arc<RwLock<BTreeSet<String>>>,
     covered_nodes: Arc<RwLock<BTreeSet<NodeIdentifier>>>,
+    promiscuous_nodes: Arc<RwLock<PromiscuousNodes>>,
     generation: AtomicU64,
     remote_node_lookup_cache: RemoteNodeLookupCache,
 }
@@ -203,6 +227,7 @@ impl RecipientIndex {
             nodes_by_server: Arc::new(RwLock::new(HashMap::new())),
             complete_servers: Arc::new(RwLock::new(BTreeSet::new())),
             covered_nodes: Arc::new(RwLock::new(BTreeSet::new())),
+            promiscuous_nodes: Arc::new(RwLock::new(PromiscuousNodes::new())),
             generation: AtomicU64::new(0),
             remote_node_lookup_cache: RemoteNodeLookupCache::new(0),
         })
@@ -239,16 +264,18 @@ impl RecipientIndex {
         *self.inner.write() = snapshot;
         self.complete_servers.write().clear();
         self.covered_nodes.write().clear();
+        self.promiscuous_nodes.write().clear();
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
 
     pub fn replace_all_complete(&self, update: RecipientIndexUpdate) {
-        let (snapshot, complete_servers, covered_nodes) = update.into_parts();
+        let (snapshot, complete_servers, covered_nodes, promiscuous_nodes) = update.into_parts();
         let channel_count = snapshot.len();
         *self.nodes_by_server.write() = nodes_by_server(&snapshot);
         *self.inner.write() = snapshot;
         *self.complete_servers.write() = complete_servers;
         *self.covered_nodes.write() = covered_nodes;
+        *self.promiscuous_nodes.write() = promiscuous_nodes;
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
 
@@ -261,11 +288,13 @@ impl RecipientIndex {
             return false;
         }
         let covered_nodes = self.covered_nodes.read();
+        let promiscuous_nodes = self.promiscuous_nodes.read();
         let recipient_nodes = self
             .nodes_by_server
             .read()
             .get(server_id)
             .into_iter()
+            .chain(promiscuous_nodes.get(server_id))
             .flat_map(|nodes| nodes.iter().copied())
             .collect::<BTreeSet<_>>();
         voice_members
@@ -283,17 +312,44 @@ impl RecipientIndex {
         if !self.covers_voice_members(server_id, voice_members) {
             return RemoteNodeLookup::Missing { channel_id: 0 };
         }
-        RemoteNodeLookup::Nodes(
-            self.nodes_by_server
-                .read()
-                .get(server_id)
-                .into_iter()
-                .flat_map(|nodes| nodes.iter())
-                .copied()
-                .filter(|node| *node != local_node_id)
-                .collect::<Vec<_>>()
-                .into(),
+        self.include_promiscuous_nodes(
+            server_id,
+            local_node_id,
+            RemoteNodeLookup::Nodes(
+                self.nodes_by_server
+                    .read()
+                    .get(server_id)
+                    .into_iter()
+                    .flat_map(|nodes| nodes.iter())
+                    .copied()
+                    .filter(|node| *node != local_node_id)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
         )
+    }
+
+    /// Add the server's promiscuous nodes to a resolved destination set. A
+    /// missing lookup already falls back to broadcast, which reaches them.
+    fn include_promiscuous_nodes(
+        &self,
+        server_id: &str,
+        local_node_id: NodeIdentifier,
+        lookup: RemoteNodeLookup,
+    ) -> RemoteNodeLookup {
+        let RemoteNodeLookup::Nodes(nodes) = lookup else {
+            return lookup;
+        };
+        let promiscuous_nodes = self.promiscuous_nodes.read();
+        let Some(extra) = promiscuous_nodes.get(server_id) else {
+            return RemoteNodeLookup::Nodes(nodes);
+        };
+        let mut merged = nodes.iter().copied().collect::<BTreeSet<_>>();
+        merged.extend(extra.iter().copied().filter(|node| *node != local_node_id));
+        if merged.len() == nodes.len() {
+            return RemoteNodeLookup::Nodes(nodes);
+        }
+        RemoteNodeLookup::Nodes(merged.into_iter().collect::<Vec<_>>().into())
     }
 
     #[cfg(test)]
@@ -465,11 +521,15 @@ impl RecipientIndex {
             return lookup;
         }
 
-        let lookup = self.lookup_remote_nodes_for_channels_uncached(
+        let lookup = self.include_promiscuous_nodes(
             server_id,
-            cache_key.channels.as_slice(),
             local_node_id,
-            complete,
+            self.lookup_remote_nodes_for_channels_uncached(
+                server_id,
+                cache_key.channels.as_slice(),
+                local_node_id,
+                complete,
+            ),
         );
         cache.entry_sync(cache_key).put_entry(lookup.clone());
         lookup
@@ -555,6 +615,7 @@ impl Default for RecipientIndex {
             nodes_by_server: Arc::new(RwLock::new(HashMap::new())),
             complete_servers: Arc::new(RwLock::new(BTreeSet::new())),
             covered_nodes: Arc::new(RwLock::new(BTreeSet::new())),
+            promiscuous_nodes: Arc::new(RwLock::new(PromiscuousNodes::new())),
             generation: AtomicU64::new(0),
             remote_node_lookup_cache: RemoteNodeLookupCache::new(0),
         }
@@ -592,6 +653,64 @@ mod tests {
         assert_eq!(
             index.lookup_remote_nodes_for_server_in_server("alpha", 7, &[1, 2, 3]),
             RemoteNodeLookup::Nodes(Arc::from([1, 2]))
+        );
+    }
+
+    #[test]
+    fn promiscuous_nodes_join_every_lookup_in_their_server_only() {
+        let index = RecipientIndex::new();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new("alpha", 5),
+            [1, 2].into_iter().collect(),
+        );
+        index.replace_all_complete(
+            RecipientIndexUpdate::new(
+                snapshot,
+                ["alpha".to_owned(), "beta".to_owned()]
+                    .into_iter()
+                    .collect(),
+                [1, 2, 3, 4].into_iter().collect(),
+            )
+            .with_promiscuous_nodes(PromiscuousNodes::from([
+                ("alpha".to_owned(), [1, 3].into_iter().collect()),
+                ("beta".to_owned(), [4].into_iter().collect()),
+            ])),
+        );
+
+        assert_eq!(
+            index.lookup_remote_nodes_for_in_server("alpha", 5, 1),
+            RemoteNodeLookup::Nodes(Arc::from([2, 3])),
+            "the speaker's own node is never a destination"
+        );
+        assert_eq!(
+            index.lookup_remote_nodes_for_complete_channels_in_server("alpha", &[6], 1, &[2, 3]),
+            RemoteNodeLookup::Nodes(Arc::from([3])),
+            "a channel with no members still reaches promiscuous nodes"
+        );
+        assert_eq!(
+            index.lookup_remote_nodes_for_server_in_server("alpha", 2, &[1, 3]),
+            RemoteNodeLookup::Nodes(Arc::from([1, 3]))
+        );
+        assert_eq!(
+            index.lookup_remote_nodes_for_in_server("alpha", 6, 2),
+            RemoteNodeLookup::Missing { channel_id: 6 },
+            "an unknown channel keeps the broadcast fallback signal"
+        );
+        assert_eq!(
+            index.lookup_remote_nodes_for_complete_channels_in_server("beta", &[5], 1, &[4]),
+            RemoteNodeLookup::Nodes(Arc::from([4]))
+        );
+
+        index.replace_all_complete(RecipientIndexUpdate::new(
+            RecipientIndexSnapshot::new(),
+            ["alpha".to_owned()].into_iter().collect(),
+            [1, 2, 3].into_iter().collect(),
+        ));
+        assert_eq!(
+            index.lookup_remote_nodes_for_complete_channels_in_server("alpha", &[6], 1, &[2, 3]),
+            RemoteNodeLookup::Nodes(Arc::from([])),
+            "a refreshed snapshot without promiscuous nodes drops them"
         );
     }
 

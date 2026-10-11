@@ -24,6 +24,10 @@ enum FrameType {
   FRAME_DICTIONARY = 6;
   // Stream-only control frame acknowledging an adaptive dictionary id.
   FRAME_DICTIONARY_ACK = 7;
+  // Stream-only control notice sent by an acceptor before closing: the
+  // dialer's node id is held by a live session from an endpoint the acceptor
+  // knows, and the dialer connected from a new one.
+  FRAME_DUPLICATE_NODE = 8;
 }
 
 // Receiver-side routing class. Selected by the sender to direct the frame

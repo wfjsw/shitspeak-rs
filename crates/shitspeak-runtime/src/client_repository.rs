@@ -12,7 +12,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
 use tokio_rustls::server::TlsStream;
 
-use shitspeak_s2s::application::voice::{RecipientIndexKey, RecipientIndexSnapshot};
+use shitspeak_s2s::application::voice::{
+    PromiscuousNodes, RecipientIndexKey, RecipientIndexSnapshot,
+};
 
 use crate::{
     client::{
@@ -78,7 +80,12 @@ pub struct ClientRepository {
     deferred_commit_pending: Arc<AtomicUsize>,
     versions: Arc<ClientVersionIndex>,
     authenticated_client_counts: AuthenticatedClientCounts,
+    /// Per-server snapshot of `ClientRegister::promiscuous_clients`, published
+    /// by the register so the voice hot path never takes the register lock.
+    promiscuous_local_clients: Arc<ParkingRwLock<PromiscuousClientSnapshot>>,
 }
+
+type PromiscuousClientSnapshot = HashMap<String, Arc<[Arc<Box<Client>>]>>;
 
 #[derive(Default)]
 struct AuthenticatedClientCounts {
@@ -397,6 +404,11 @@ pub struct ClientRegister {
     client_channel: HashMap<ScopedSessionId, ScopedChannelId>,
     /// Maps (server_id, channel_id) → set of local session IDs listening to that channel.
     listeners_by_channel: HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
+    /// Local sessions holding the `promiscuous` privilege; they receive every
+    /// voice packet in their server.
+    promiscuous_clients: HashSet<ScopedSessionId>,
+    /// Lock-free-to-read copy of `promiscuous_clients`, rebuilt on change.
+    promiscuous_snapshot: Arc<ParkingRwLock<PromiscuousClientSnapshot>>,
 }
 
 struct RemoteClientRegister {
@@ -507,12 +519,53 @@ impl ClientRegister {
         });
     }
 
+    fn promiscuous_index_set(&mut self, id: &ScopedSessionId, promiscuous: bool) {
+        let changed = if promiscuous {
+            self.promiscuous_clients.insert(id.clone())
+        } else {
+            self.promiscuous_clients.remove(id)
+        };
+        if changed {
+            self.publish_promiscuous_snapshot();
+        }
+    }
+
+    fn publish_promiscuous_snapshot(&self) {
+        let mut by_server = HashMap::<String, Vec<Arc<Box<Client>>>>::new();
+        for id in &self.promiscuous_clients {
+            if let Some(client) = self.local_clients.get(id) {
+                by_server
+                    .entry(id.server_id().to_owned())
+                    .or_default()
+                    .push(Arc::clone(client));
+            }
+        }
+        *self.promiscuous_snapshot.write() = by_server
+            .into_iter()
+            .map(|(server_id, clients)| (server_id, Arc::from(clients)))
+            .collect();
+    }
+
+    /// Remove a departing local session from every voice-routing index.
+    /// Call after the session has left `local_clients`.
+    fn remove_local_voice_indexes(&mut self, id: &ScopedSessionId) {
+        self.channel_index_remove(id);
+        self.listener_index_remove_all(id);
+        if self.promiscuous_clients.remove(id) {
+            self.publish_promiscuous_snapshot();
+        }
+    }
+
     fn sync_local_client_indexes(&mut self, scoped_id: &ScopedSessionId, client: &Client) {
         self.channel_index_move(scoped_id.clone(), client.get_current_channel_id());
         self.listener_index_remove_all(scoped_id);
         for channel_id in client.get_listening_channel_ids() {
             self.listener_index_add(scoped_id.clone(), channel_id);
         }
+        self.promiscuous_index_set(
+            scoped_id,
+            client.has_privilege(shitspeak_core::Privilege::Promiscuous),
+        );
     }
 }
 
@@ -643,6 +696,7 @@ impl ClientRepository {
     pub fn new(local_node_id: u16, log_max_entries: usize) -> Self {
         let log_max_entries = log_max_entries.max(1);
         let (tx, _) = broadcast::channel(projection_broadcast_capacity(log_max_entries));
+        let promiscuous_local_clients = Arc::new(ParkingRwLock::new(HashMap::new()));
         let register = Arc::new(AsyncRwLock::new(ClientRegister {
             local_clients: HashMap::new(),
             authenticated_local_clients: HashSet::new(),
@@ -651,6 +705,8 @@ impl ClientRepository {
             clients_by_channel: HashMap::new(),
             client_channel: HashMap::new(),
             listeners_by_channel: HashMap::new(),
+            promiscuous_clients: HashSet::new(),
+            promiscuous_snapshot: Arc::clone(&promiscuous_local_clients),
         }));
         let versions = Arc::new(ClientVersionIndex::default());
         let remote_registers = Arc::new(AsyncRwLock::new(HashMap::new()));
@@ -697,6 +753,7 @@ impl ClientRepository {
             deferred_commit_pending,
             versions,
             authenticated_client_counts: AuthenticatedClientCounts::default(),
+            promiscuous_local_clients,
         }
     }
 
@@ -919,8 +976,7 @@ impl ClientRepository {
             let new_id = ClientSessionIdentifier::new(self.local_node_id, new_local_id)
                 .expect("repository allocated a valid local session ID");
             let new_scoped_id = ScopedSessionId::new(new_server_id.to_owned(), new_id);
-            register.channel_index_remove(&old_scoped_id);
-            register.listener_index_remove_all(&old_scoped_id);
+            register.remove_local_voice_indexes(&old_scoped_id);
             if register.authenticated_local_clients.remove(&old_scoped_id) {
                 self.authenticated_client_counts.decrement(old_server_id);
                 self.authenticated_client_counts
@@ -1343,8 +1399,7 @@ impl ClientRepository {
             }
 
             if let Some(client) = register.local_clients.remove(&scoped_id) {
-                register.channel_index_remove(&scoped_id);
-                register.listener_index_remove_all(&scoped_id);
+                register.remove_local_voice_indexes(&scoped_id);
                 if register.authenticated_local_clients.remove(&scoped_id) {
                     self.authenticated_client_counts.decrement(server_id);
                     self.authenticated_client_counts.local_decrement(server_id);
@@ -1494,6 +1549,25 @@ impl ClientRepository {
 
     /// Remove the visible transient state for an offline origin while
     /// retaining its epoch fence against delayed packets.
+    /// Drop every remote origin's clients.
+    ///
+    /// A re-incarnation of the S2S stack otherwise reseeds the previous
+    /// incarnation's remote origins from `known_remote_origin_versions`, and
+    /// origins that left during the gap never come back to clear themselves.
+    pub(crate) async fn remove_all_remote_origins(&self) -> usize {
+        let origins: Vec<u16> = self
+            .remote_register_snapshots()
+            .await
+            .into_iter()
+            .map(|(node_id, _)| node_id)
+            .collect();
+        let count = origins.len();
+        for node_id in origins {
+            self.remove_clients_from_node(node_id).await;
+        }
+        count
+    }
+
     pub(crate) async fn remove_clients_from_node(&self, node_id: u16) {
         if node_id == self.local_node_id {
             panic!("Not supposed to clear clients from the local node");
@@ -2002,6 +2076,42 @@ impl ClientRepository {
             }
         }
         result
+    }
+
+    /// Local clients that receive every voice packet in `server_id`. Runs on
+    /// every voice packet, so it reads a published snapshot instead of taking
+    /// the register lock.
+    pub(crate) fn local_promiscuous_clients_in_server(
+        &self,
+        server_id: &str,
+    ) -> Option<Arc<[Arc<Box<Client>>]>> {
+        self.promiscuous_local_clients.read().get(server_id).cloned()
+    }
+
+    /// Nodes per server hosting a promiscuous client, local or replicated.
+    /// S2S targeted delivery adds them to every destination set.
+    pub async fn promiscuous_voice_nodes_snapshot(&self) -> PromiscuousNodes {
+        let mut nodes = PromiscuousNodes::new();
+        {
+            let register = self.register.read().await;
+            for id in &register.promiscuous_clients {
+                nodes
+                    .entry(id.server_id().to_owned())
+                    .or_default()
+                    .insert(id.session_id().get_node_id());
+            }
+        }
+        for (_, register) in self.remote_register_snapshots().await {
+            for (id, client) in &register.read().await.clients {
+                if client.has_privilege(shitspeak_core::Privilege::Promiscuous) {
+                    nodes
+                        .entry(id.server_id().to_owned())
+                        .or_default()
+                        .insert(id.session_id().get_node_id());
+                }
+            }
+        }
+        nodes
     }
 
     /// Build a channel/listener interest snapshot for S2S voice node targeting.
@@ -3548,6 +3658,12 @@ impl ClientRepository {
                     register.listener_index_remove_channel(&scoped_id, ch);
                 }
             }
+            if let Some(privileges) = delta.resolve_privileges() {
+                register.promiscuous_index_set(
+                    &scoped_id,
+                    privileges.contains(shitspeak_core::Privilege::Promiscuous),
+                );
+            }
         }
 
         // Suppress log entries and broadcasts for UpdateGlobalState on
@@ -5085,6 +5201,101 @@ mod tests {
             .expect("beta listener channel is tracked");
         assert_eq!(beta_listener_nodes, &std::collections::BTreeSet::from([2]));
         assert!(!snapshot.contains_key(&RecipientIndexKey::new("alpha", 84)));
+    }
+
+    #[tokio::test]
+    async fn promiscuous_index_tracks_privilege_changes_removal_and_remote_nodes() {
+        let repo = ClientRepository::new(1, 128);
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                real_ip,
+                SocketAddr::new(real_ip, 30001),
+                local_addr,
+                tx,
+            )
+            .await;
+        client.set_authenticated(true);
+        let session = client.get_session_id();
+        let set_promiscuous = |promiscuous: bool| {
+            let mut gs = client.write_global_state(&repo);
+            gs.set_privileges(if promiscuous {
+                shitspeak_core::Privilege::Promiscuous.into()
+            } else {
+                shitspeak_core::Privileges::empty()
+            });
+        };
+        let local_promiscuous = |server_id: &'static str| {
+            let repo = &repo;
+            async move {
+                repo.local_promiscuous_clients_in_server(server_id)
+                    .iter()
+                    .flat_map(|clients| clients.iter())
+                    .map(|client| client.get_session_id())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        set_promiscuous(true);
+        repo.publish_client_in_server("alpha", session).await;
+        assert_eq!(local_promiscuous("alpha").await, vec![session]);
+        assert!(local_promiscuous("beta").await.is_empty());
+        assert_eq!(
+            repo.promiscuous_voice_nodes_snapshot().await,
+            PromiscuousNodes::from([("alpha".to_owned(), [1].into_iter().collect())])
+        );
+
+        set_promiscuous(false);
+        repo.wait_for_deferred_commits().await;
+        assert!(local_promiscuous("alpha").await.is_empty());
+        assert!(repo.promiscuous_voice_nodes_snapshot().await.is_empty());
+
+        set_promiscuous(true);
+        repo.wait_for_deferred_commits().await;
+        assert_eq!(local_promiscuous("alpha").await, vec![session]);
+
+        repo.remove_client_in_server("alpha", session).await;
+        assert!(local_promiscuous("alpha").await.is_empty());
+
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let remote_add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: "beta".to_owned(),
+                session_id: remote_session,
+                client_instance_id: 7,
+                real_ip,
+                tcp_addr: SocketAddr::new(real_ip, 30003),
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta {
+                    current_channel_id: Some(42),
+                    privileges: Some(
+                        shitspeak_core::Privileges::from(shitspeak_core::Privilege::Promiscuous)
+                            .names(),
+                    ),
+                    ..Default::default()
+                },
+            },
+        });
+        repo.apply_remote_operation(remote_add, 1).await.unwrap();
+        assert_eq!(
+            repo.promiscuous_voice_nodes_snapshot().await,
+            PromiscuousNodes::from([("beta".to_owned(), [2].into_iter().collect())]),
+            "replicated promiscuous clients mark their owning node"
+        );
+        assert!(
+            local_promiscuous("beta").await.is_empty(),
+            "remote clients never join the local delivery index"
+        );
     }
 
     #[tokio::test]

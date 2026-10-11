@@ -1401,6 +1401,16 @@ async fn emit_once_with_reason(
                 reason = ?reason,
                 "local lsa rejected by local lsdb; suppressing flood"
             );
+            if let Some(guard) = lsdb.identity_guard()
+                && let Some(known) = lsdb.known_version(lsa_origin)
+            {
+                guard.report_trigger(
+                    crate::overlay::identity_guard::FenceTrigger::LocalLsaSuppressed {
+                        foreign_epoch: known.boot_epoch,
+                        foreign_seq: known.seq,
+                    },
+                );
+            }
             return;
         }
     }
@@ -1436,10 +1446,26 @@ pub async fn handle_flood(
     flood: pb::LsaFlood,
 ) {
     let mut accepted: Vec<pb::LinkStateAdvert> = Vec::new();
+    let self_id = lsdb.local_node_id();
     for pb_lsa in flood.advertisements {
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
+        // This node is authoritative for its own LSA. A foreign copy would
+        // replace our entry and suppress our own floods, so it is never
+        // admitted — only recorded as evidence that someone else is
+        // claiming our identity.
+        if lsa.origin == self_id {
+            if let Some(guard) = lsdb.identity_guard() {
+                guard.report_trigger(
+                    crate::overlay::identity_guard::FenceTrigger::ForeignSelfLsa {
+                        foreign_epoch: lsa.boot_epoch,
+                        foreign_seq: lsa.seq,
+                    },
+                );
+            }
+            continue;
+        }
         duplicate_detector.observe_epoch(
             lsa.origin,
             lsa.boot_epoch,
@@ -1455,13 +1481,49 @@ pub async fn handle_flood(
                 learn_from_lsa(transport, &lsa);
                 accepted.push(pb_lsa);
             }
-            AdmissionResult::Stale | AdmissionResult::BelowFloor => {}
+            AdmissionResult::Stale | AdmissionResult::BelowFloor => {
+                notice_origin_if_fenced(lsdb, transport, self_id, sender, &lsa).await;
+            }
         }
     }
     if !accepted.is_empty() {
         let snap = monitor.snapshot();
         pacer.enqueue_reflood_to_neighbors(&snap, accepted, Some(sender));
     }
+}
+
+/// Tell an LSA origin that a higher epoch for it is already known here.
+///
+/// Only the origin itself is notified: a relayed copy that loses is ordinary
+/// anti-entropy, not an identity conflict. Without this the fenced origin
+/// never learns why its advertisements vanish — its peers hold a higher
+/// epoch for it and, after the impostor leaves, that epoch survives only in
+/// the persisted floor.
+pub(crate) async fn notice_origin_if_fenced(
+    lsdb: &LinkStateDb,
+    transport: &ConnectionManager,
+    self_id: NodeIdentifier,
+    sender: NodeIdentifier,
+    lsa: &LsaEntry,
+) {
+    if sender != lsa.origin {
+        return;
+    }
+    let Some(known) = lsdb.known_version(lsa.origin) else {
+        return;
+    };
+    if known.boot_epoch <= lsa.boot_epoch {
+        return;
+    }
+    crate::overlay::identity::send_origin_fenced(
+        transport,
+        self_id,
+        sender,
+        lsa.origin,
+        known.boot_epoch,
+        known.seq,
+    )
+    .await;
 }
 
 /// Capture `boot_epoch` for this process. Microsecond-precision since

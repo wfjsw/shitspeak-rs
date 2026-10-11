@@ -597,6 +597,13 @@ fn next_boot_epoch(captured: u64, previous: Option<u64>) -> u64 {
         .unwrap_or(captured)
 }
 
+/// Reserve a boot-epoch floor for this process. The next overlay start gets
+/// an epoch strictly above `floor`, so re-incarnating after an impostor with
+/// a clock ahead of ours still outranks it.
+pub fn reserve_boot_epoch_floor(floor: u64) -> u64 {
+    reserve_process_boot_epoch(floor)
+}
+
 fn reserve_process_boot_epoch(candidate: u64) -> u64 {
     let mut next = candidate;
     loop {
@@ -635,6 +642,9 @@ pub(crate) struct OverlayInner {
     pub emitter: Arc<LsaEmitter>,
     pub flood_pacer: Arc<LsaFloodPacer>,
     pub hello: Arc<HelloContext>,
+    /// Watches for another process fencing this node id and asks for
+    /// re-incarnation once that process is gone.
+    pub identity_guard: Arc<super::identity_guard::IdentityGuard>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
     boot_epoch_durability: BootEpochDurability,
@@ -721,6 +731,13 @@ impl OverlayInner {
             nonce_counter: AtomicU64::new(1),
         });
 
+        let identity_guard = super::identity_guard::IdentityGuard::new(
+            self_id,
+            boot_epoch,
+            transport.clone(),
+            shutdown.clone(),
+        );
+
         Self {
             self_id,
             boot_epoch,
@@ -737,6 +754,7 @@ impl OverlayInner {
             emitter,
             flood_pacer,
             hello,
+            identity_guard,
             shutdown,
             cfg,
             boot_epoch_durability: captured_boot_epoch.durability,
@@ -899,8 +917,15 @@ impl OverlayInner {
             cfg: self.cfg.clone(),
             emitter: self.emitter.clone(),
             flood_pacer: self.flood_pacer.clone(),
+            identity_guard: Some(self.identity_guard.clone()),
         });
         super::inbound::spawn_dispatcher(dctx, inbound);
+        self.lsdb.set_identity_guard(self.identity_guard.clone());
+        self.identity_guard.spawn();
+        self.transport.set_identity_liveness_oracle(Some(Arc::new({
+            let monitor = self.neighbor.clone();
+            move |node| monitor.hello_liveness(node)
+        })));
 
         if let Some(dir) = self.cfg.persistence_dir().cloned() {
             super::discovery::spawn_persister(
@@ -1407,6 +1432,31 @@ mod tests {
         assert!(second.durability.readiness.is_ready());
         assert!(second.value > first.value);
         assert_eq!(read_local_boot_epoch(&path, 7).unwrap(), Some(second.value));
+    }
+
+    /// Automatic recovery from an impostor is a restart in everything but the
+    /// process: the re-incarnated overlay must mint an epoch above the
+    /// impostor's, even when the impostor's clock ran ahead of ours. Without
+    /// that, peers keep fencing the real node and only a manual restart helps.
+    #[test]
+    fn re_incarnation_epoch_outranks_an_impostor_with_a_later_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let persistence_dir = dir.path().to_path_buf();
+        // An impostor whose wall clock is far ahead of this machine's.
+        let impostor_epoch = 4_000_000_000_000_000u64;
+
+        let floor = reserve_boot_epoch_floor(impostor_epoch);
+        assert!(
+            floor >= impostor_epoch,
+            "the reserved floor must cover the impostor's epoch"
+        );
+
+        let re_incarnated = capture_monotonic_boot_epoch(7, Some(&persistence_dir));
+        assert!(
+            re_incarnated.value > impostor_epoch,
+            "a re-incarnation must outrank the impostor: {} vs {impostor_epoch}",
+            re_incarnated.value
+        );
     }
 
     #[test]

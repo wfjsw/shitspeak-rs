@@ -720,6 +720,48 @@ fn push_unique_target(
     }
 }
 
+/// Add local `promiscuous` clients that are not already recipients. They hear
+/// every routed packet in their server as listen audio, but never a sender
+/// they cannot see.
+async fn append_promiscuous_targets(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
+    sender_id: ClientSessionIdentifier,
+    targets: &mut Vec<(Arc<Box<Client>>, AudioContext)>,
+) {
+    let Some(clients) = server
+        .get_clients()
+        .local_promiscuous_clients_in_server(server_id)
+    else {
+        return;
+    };
+    let mut recipients: HashSet<(ClientSessionIdentifier, ClientInstanceId)> = targets
+        .iter()
+        .map(|(client, _)| (client.get_session_id(), client.client_instance_id()))
+        .collect();
+    let mut seen = HashSet::new();
+    let sender_instance_id = sender.map(|sender| sender.client_instance_id());
+    for client in clients.iter().cloned() {
+        if !recipients.insert((client.get_session_id(), client.client_instance_id())) {
+            continue;
+        }
+        if let Some(sender) = sender {
+            if !crate::client::visibility::can_view_user(server, &client, sender).await {
+                continue;
+            }
+        }
+        push_unique_target(
+            targets,
+            &mut seen,
+            sender_id,
+            sender_instance_id,
+            client,
+            AudioContext::Listen,
+        );
+    }
+}
+
 fn live_targets_from_local_fanout_snapshot(
     targets: &[(Arc<Box<Client>>, AudioContext)],
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
@@ -1724,7 +1766,7 @@ async fn route_voice_inner(
     } else {
         None
     };
-    let targets = if let (Some(vt), Some(authorized_target)) =
+    let mut targets = if let (Some(vt), Some(authorized_target)) =
         (voice_target.as_ref(), authorized_channels.as_ref())
     {
         resolved_voice_target_recipients(
@@ -1758,6 +1800,9 @@ async fn route_voice_inner(
         .as_ref()
         .map(AuthorizedVoiceTarget::has_authorized_target)
         .unwrap_or(true);
+    if has_authorized_s2s_target {
+        append_promiscuous_targets(server, Some(sender), &server_id, sender_id, &mut targets).await;
+    }
     let s2s_target_channels = authorized_channels
         .as_ref()
         .and_then(AuthorizedVoiceTarget::s2s_channel_ids)
@@ -1961,13 +2006,21 @@ async fn route_decoded_s2s_voice_frame(
         }
     };
 
-    let targets = resolve_s2s_voice_intent(
+    let mut targets = resolve_s2s_voice_intent(
         server,
         replicated_sender.as_ref(),
         &server_id,
         sender_id,
         &intent,
         audio_context_from_target_kind(frame.target_kind),
+    )
+    .await;
+    append_promiscuous_targets(
+        server,
+        replicated_sender.as_ref(),
+        &server_id,
+        sender_id,
+        &mut targets,
     )
     .await;
 

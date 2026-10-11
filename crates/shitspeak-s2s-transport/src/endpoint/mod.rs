@@ -21,8 +21,9 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use bytes::Bytes;
 use futures_util::future::join_all;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, trace, warn};
@@ -31,9 +32,14 @@ use crate::types::NodeIdentifier;
 
 use super::config::TransportConfig;
 use super::connection::{PeerState, StreamKey, retry_cap_for_last_seen_age};
+use super::duplicate_identity::{
+    DuplicateIdentityEvidence, SELF_LOOP_ACCEPT_GRACE, SELF_LOOP_EXPORTER_LABEL,
+    SELF_LOOP_EXPORTER_LEN, SelfLoopExporter,
+};
+use super::frame::{FrameType, build_frame, encode_frame_to_bytes};
 use super::manager::ManagerInner;
 use super::native_stats::BoxedNativeLossSampler;
-use super::service_level::{PeerAddress, SeedAddress, TransportKind};
+use super::service_level::{MessageClass, PeerAddress, SeedAddress, ServiceLevel, TransportKind};
 use super::stream_io::{StreamPumpConfig, spawn_stream_pump};
 
 pub(crate) mod kcp;
@@ -269,6 +275,7 @@ pub(crate) fn install_stream_session<S>(
     transport: TransportKind,
     remote_addr: Option<SocketAddr>,
     is_dialer: bool,
+    dial_started_at: Option<Instant>,
     stream: S,
     native_sampler: Option<BoxedNativeLossSampler>,
 ) where
@@ -292,7 +299,8 @@ pub(crate) fn install_stream_session<S>(
         (transport == TransportKind::Kcp).then(|| inner.cfg().kcp_tuning().no_progress_close()),
         inner.cfg().compression_config().clone(),
         inner.cfg().max_pending_pings(),
-    );
+    )
+    .with_dial_started_at(dial_started_at);
     let active = spawn_stream_pump(
         stream,
         cfg,
@@ -998,6 +1006,195 @@ fn is_self_loop_error(error: &io::Error) -> bool {
     error.to_string().contains("self-loop rejected")
 }
 
+fn self_loop_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "self-loop rejected")
+}
+
+/// Keying material both ends of one TLS connection derive identically.
+pub(crate) fn tls_self_loop_exporter<D>(
+    conn: &rustls::ConnectionCommon<D>,
+) -> Option<SelfLoopExporter> {
+    conn.export_keying_material(
+        [0u8; SELF_LOOP_EXPORTER_LEN],
+        SELF_LOOP_EXPORTER_LABEL,
+        None,
+    )
+    .ok()
+}
+
+pub(crate) fn quic_self_loop_exporter(conn: &quinn::Connection) -> Option<SelfLoopExporter> {
+    let mut exporter = [0u8; SELF_LOOP_EXPORTER_LEN];
+    conn.export_keying_material(&mut exporter, SELF_LOOP_EXPORTER_LABEL, b"")
+        .ok()?;
+    Some(exporter)
+}
+
+/// Acceptor side of a session presenting our own identity. Remember the
+/// connection so this process's dialer can tell a loopback/hairpin apart from
+/// another machine holding the identity, then reject it.
+pub(crate) fn reject_accepted_self_loop(
+    inner: &ManagerInner,
+    exporter: Option<SelfLoopExporter>,
+) -> io::Error {
+    if let Some(exporter) = exporter {
+        inner.self_loops().record_accepted(exporter);
+    }
+    self_loop_error()
+}
+
+/// Dialer side of a session presenting our own identity. A connection this
+/// process also accepted looped back through a local listener or NAT hairpin;
+/// any other one reached a different process holding our identity.
+pub(crate) async fn classify_dialed_self_loop(
+    inner: &ManagerInner,
+    transport: TransportKind,
+    remote: SocketAddr,
+    exporter: Option<SelfLoopExporter>,
+) -> io::Error {
+    let Some(exporter) = exporter else {
+        return self_loop_error();
+    };
+    if inner
+        .self_loops()
+        .accepted_by_this_process(&exporter, SELF_LOOP_ACCEPT_GRACE)
+        .await
+    {
+        return self_loop_error();
+    }
+    inner
+        .inbound()
+        .duplicate_identity()
+        .report(DuplicateIdentityEvidence::remote_self_loop(
+            transport, remote,
+        ));
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("duplicate node id: {remote} presents this node's identity"),
+    )
+}
+
+/// Why an inbound session for a live node id was refused.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdentityConflict {
+    pub(crate) incumbent: SocketAddr,
+    /// Overlay liveness of the incumbent, handed to the dialer so its boot
+    /// check has evidence the competitor is alive rather than merely that a
+    /// leftover session exists.
+    pub(crate) boot_epoch: u64,
+    pub(crate) hello_age: Duration,
+}
+
+/// Inbound session for a node id that already holds a live session from a
+/// known endpoint while this one comes from a new endpoint: the incumbent
+/// keeps the identity.
+///
+/// Both conditions are required. With no overlay liveness oracle, or when the
+/// incumbent is not a live overlay neighbour, the session is admitted — a
+/// leftover session says nothing about who is alive.
+pub(crate) fn inbound_identity_conflict(
+    inner: &ManagerInner,
+    peer_node: NodeIdentifier,
+    transport: TransportKind,
+    remote: SocketAddr,
+) -> Option<IdentityConflict> {
+    let (boot_epoch, hello_age) = inner.overlay_liveness(peer_node)?;
+    let incumbent = inner
+        .get_peer(peer_node)?
+        .live_incumbent_for_new_endpoint(remote)?;
+    warn!(
+        peer = peer_node,
+        ?transport,
+        %remote,
+        %incumbent,
+        boot_epoch,
+        hello_age_ms = hello_age.as_millis() as u64,
+        "rejected inbound S2S session: node id is held by a live overlay neighbour from a known endpoint"
+    );
+    Some(IdentityConflict {
+        incumbent,
+        boot_epoch,
+        hello_age,
+    })
+}
+
+fn duplicate_identity_rejection_error(
+    peer_node: NodeIdentifier,
+    remote: SocketAddr,
+    incumbent: SocketAddr,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "duplicate node id {peer_node} from new endpoint {remote}; live incumbent at {incumbent}"
+        ),
+    )
+}
+
+/// Tell a stream dialer that its node id is held by a live incumbent, then
+/// close. Peers that predate the notice ignore the unknown frame type.
+pub(crate) async fn reject_duplicate_identity_stream<S>(
+    inner: &ManagerInner,
+    stream: &mut S,
+    peer_node: NodeIdentifier,
+    remote: SocketAddr,
+    conflict: IdentityConflict,
+) -> io::Error
+where
+    S: AsyncWrite + Unpin,
+{
+    let payload = Bytes::from(super::duplicate_identity::encode_attestation(
+        &super::duplicate_identity::LivenessAttestation {
+            boot_epoch: conflict.boot_epoch,
+            hello_age: conflict.hello_age,
+            not_before: Instant::now(),
+        },
+    ));
+    let incumbent = conflict.incumbent;
+    let frame = build_frame(
+        inner.self_id(),
+        peer_node,
+        ServiceLevel::Reliable,
+        FrameType::DuplicateNode,
+        MessageClass::Control,
+        0,
+        payload,
+    );
+    if let Ok(encoded) = encode_frame_to_bytes(&frame) {
+        let notice = async {
+            let len = u32::try_from(encoded.len()).map_err(io::Error::other)?;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&encoded).await?;
+            stream.flush().await?;
+            stream.shutdown().await
+        };
+        if let Err(error) = timeout(inner.cfg().stream_write_timeout(), notice)
+            .await
+            .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut)))
+        {
+            debug!(peer = peer_node, %remote, %error, "duplicate node id notice not delivered");
+        }
+    }
+    duplicate_identity_rejection_error(peer_node, remote, incumbent)
+}
+
+/// QUIC counterpart of [`reject_duplicate_identity_stream`].
+pub(crate) fn reject_duplicate_identity_quic(
+    conn: &quinn::Connection,
+    peer_node: NodeIdentifier,
+    remote: SocketAddr,
+    conflict: IdentityConflict,
+) -> io::Error {
+    let reason = super::duplicate_identity::encode_attestation(
+        &super::duplicate_identity::LivenessAttestation {
+            boot_epoch: conflict.boot_epoch,
+            hello_age: conflict.hello_age,
+            not_before: Instant::now(),
+        },
+    );
+    conn.close(quic::QUIC_CLOSE_DUPLICATE_NODE.into(), &reason);
+    duplicate_identity_rejection_error(peer_node, remote, conflict.incumbent)
+}
+
 async fn dial_resolved_seed_address(
     inner: &Arc<ManagerInner>,
     addr: PeerAddress,
@@ -1027,7 +1224,7 @@ async fn dial_resolved_seed_address(
 
 /// How long resolving a seed's host name may take before the probe gives up.
 /// A dead resolver then costs one failed probe, retried on the seed's backoff.
-const SEED_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SEED_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The system resolver: a blocking `getaddrinfo`.
 fn system_lookup(addr: String) -> io::Result<Vec<SocketAddr>> {

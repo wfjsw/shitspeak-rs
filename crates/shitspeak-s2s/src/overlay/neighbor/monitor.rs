@@ -569,6 +569,23 @@ impl NeighborMonitor {
             .unwrap_or(false)
     }
 
+    /// Overlay liveness of `node`: its boot epoch and how long ago we last
+    /// heard a Hello or HelloAck from it, when the link is up.
+    ///
+    /// This is the transport's liveness oracle. A live link here means the
+    /// node is participating on the overlay right now, which is a stronger
+    /// statement than "a TLS session exists".
+    pub fn hello_liveness(&self, node: NodeIdentifier) -> Option<(u64, Duration)> {
+        let now = Instant::now();
+        let state = self.state.lock();
+        let s = state.get(&node)?;
+        if !s.is_up {
+            return None;
+        }
+        let since = now.saturating_duration_since(s.last_ack_at?);
+        Some((s.boot_epoch, since))
+    }
+
     /// Return the best fresh direct-peer wall-clock estimate. The result is
     /// deliberately local-only: LSAs never advertise clock offsets.
     pub fn peer_clock_offset(&self, node: NodeIdentifier) -> Option<PeerClockOffset> {

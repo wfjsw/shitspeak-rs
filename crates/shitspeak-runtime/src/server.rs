@@ -866,8 +866,42 @@ impl Server {
                 self,
                 internal_rx.clone(),
             );
-        let s2s_task = Arc::clone(&self.s2s_manager)
-            .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
+        // S2S runs under a supervisor so the identity guard can retire and
+        // replace one incarnation without restarting the server: an impostor
+        // that fenced this node's id is cleared by minting a higher epoch,
+        // which a fresh incarnation does.
+        let s2s_task = {
+            let manager = Arc::clone(&self.s2s_manager);
+            let server = Arc::downgrade(self);
+            let clients = Arc::clone(&self.clients);
+            let mut shutdown = internal_rx.clone();
+            let _ = shutdown.borrow_and_update();
+            tokio::spawn(async move {
+                loop {
+                    let task = manager
+                        .clone()
+                        .spawn_runtime_task(server.clone(), shutdown.clone());
+                    task.join().await;
+                    let Some(request) = manager.take_reincarnation_request() else {
+                        break;
+                    };
+                    if shutdown.has_changed().unwrap_or(true) {
+                        // The server itself is stopping; do not come back up.
+                        break;
+                    }
+                    let purged = clients.remove_all_remote_origins().await;
+                    let epoch = shitspeak_s2s::overlay::reserve_boot_epoch_floor(
+                        request.floor_epoch,
+                    );
+                    tracing::info!(
+                        floor_epoch = request.floor_epoch,
+                        new_epoch = epoch,
+                        purged_remote_origins = purged,
+                        "re-incarnating S2S above the impostor's boot epoch"
+                    );
+                }
+            })
+        };
         let metrics_source: Arc<dyn crate::observability::S2sMetricsSource> =
             Arc::new(crate::observability::ServerMetricsSource::new(
                 self.s2s_manager.clone(),
@@ -943,7 +977,7 @@ impl Server {
         let _ = pending_delete_watchdog.await;
         while extension_tasks.join_next().await.is_some() {}
         let _ = remote_channel_cache_observer.await;
-        s2s_task.join().await;
+        let _ = s2s_task.await;
         if let Some(task) = observability_metrics_task {
             let _ = task.await;
         }

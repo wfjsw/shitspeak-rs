@@ -47,10 +47,15 @@ pub enum Privilege {
     /// Channel names are always supplied as entered, never translated into
     /// this user's language.
     NoChannelNameTranslation = 1 << 11,
+    /// Receive every voice packet routed in this user's virtual server on any
+    /// node, regardless of channel, listener, or voice-target selection.
+    /// Senders this user cannot see stay inaudible, and deafening still
+    /// silences everything.
+    Promiscuous = 1 << 12,
 }
 
 impl Privilege {
-    pub const ALL: [Privilege; 12] = [
+    pub const ALL: [Privilege; 13] = [
         Privilege::SeeAll,
         Privilege::Suppress,
         Privilege::ServerModeration,
@@ -63,6 +68,7 @@ impl Privilege {
         Privilege::TextMessage,
         Privilege::HideSelf,
         Privilege::NoChannelNameTranslation,
+        Privilege::Promiscuous,
     ];
 
     /// Stable name used by authenticators and replication.
@@ -80,6 +86,7 @@ impl Privilege {
             Privilege::TextMessage => "text_message",
             Privilege::HideSelf => "hide_self",
             Privilege::NoChannelNameTranslation => "no_channel_name_translation",
+            Privilege::Promiscuous => "promiscuous",
         }
     }
 

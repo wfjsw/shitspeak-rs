@@ -6,6 +6,7 @@
 //! surface stays compact.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -865,6 +866,234 @@ async fn simultaneous_kcp_dials_converge_without_tls_role_collision() {
 
     mgr_a.shutdown().await;
     mgr_b.shutdown().await;
+}
+
+fn loopback_v6(port: u16) -> SocketAddr {
+    SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port)
+}
+
+async fn wait_for_duplicate_identity(mgr: &ConnectionManager) -> crate::DuplicateIdentityEvidence {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(evidence) = mgr.duplicate_identity_evidence() {
+            return evidence;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("duplicate identity was never reported");
+}
+
+/// Regression: on 2026-10-04 a node booted with another node's certificate.
+/// Its seed dial reached the incumbent and failed with "self-loop rejected",
+/// which was filed as "seed resolves to this node" and the impostor joined
+/// the overlay. A dial that reaches a different process presenting the local
+/// identity must be reported as duplicate-identity evidence.
+#[tokio::test]
+async fn seed_dial_to_remote_holder_of_local_identity_reports_duplicate() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[2]);
+    let port_incumbent = pick_free_port().await;
+    let port_impostor = pick_free_port().await;
+    let cfg_incumbent = config_for(&pki, 0, loopback(port_incumbent));
+    let cfg_impostor = config_for(&pki, 0, loopback(port_impostor)).with_seed_target(
+        SeedAddress::new(loopback(port_incumbent).to_string(), TransportKind::Tcp),
+    );
+
+    let (incumbent, _inbound_incumbent) = ConnectionManager::start(cfg_incumbent).await.unwrap();
+    let (impostor, _inbound_impostor) = ConnectionManager::start(cfg_impostor).await.unwrap();
+
+    assert!(
+        impostor
+            .wait_initial_seed_dials(impostor.initial_seed_dial_bound())
+            .await,
+        "initial seed dial never finished"
+    );
+    let evidence = impostor
+        .duplicate_identity_evidence()
+        .expect("seed dial to the incumbent must prove a duplicate identity");
+    assert_eq!(
+        evidence.kind(),
+        crate::DuplicateIdentityEvidenceKind::RemoteSelfLoop
+    );
+    assert_eq!(evidence.transport(), TransportKind::Tcp);
+    assert_eq!(evidence.remote(), Some(loopback(port_incumbent)));
+    assert_eq!(incumbent.duplicate_identity_evidence(), None);
+
+    impostor.shutdown().await;
+    incumbent.shutdown().await;
+}
+
+/// A dial that loops back into this process's own listener (loopback or NAT
+/// hairpin) is a plain self-loop, not a duplicate identity.
+#[tokio::test]
+async fn dial_looping_back_to_own_listener_is_not_duplicate_identity() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[2]);
+    let port = pick_free_port().await;
+    let (mgr, _inbound) = ConnectionManager::start(config_for(&pki, 0, loopback(port)))
+        .await
+        .unwrap();
+
+    // The address book claims node 5 lives at our own listener.
+    mgr.add_address(5, PeerAddress::new(loopback(port), TransportKind::Tcp))
+        .await;
+    tokio::time::sleep(crate::duplicate_identity::SELF_LOOP_ACCEPT_GRACE + Duration::from_secs(1))
+        .await;
+
+    assert_eq!(mgr.duplicate_identity_evidence(), None);
+    mgr.shutdown().await;
+}
+
+/// A peer holding a live session for node 2 refuses another node-2 session
+/// from an endpoint it has never seen node 2 at, and tells the dialer.
+#[tokio::test]
+async fn tcp_peer_rejects_live_identity_from_new_endpoint() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_peer = pick_free_port().await;
+    let port_peer_v6 = pick_free_port().await;
+    let port_incumbent = pick_free_port().await;
+    let port_impostor = pick_free_port().await;
+    let cfg_peer =
+        config_for(&pki, 0, loopback(port_peer)).with_tcp_listen(loopback_v6(port_peer_v6));
+    let (peer, _inbound_peer) = ConnectionManager::start(cfg_peer).await.unwrap();
+    // Transport state alone cannot call a second session a duplicate: only an
+    // overlay knows which node ids are live neighbours. Install an oracle that
+    // reports node 2 as live, the way a running overlay would.
+    peer.set_identity_liveness_oracle(Some(Arc::new(|node| {
+        (node == 2).then_some((777u64, Duration::from_millis(50)))
+    })));
+    let (incumbent, _inbound_incumbent) =
+        ConnectionManager::start(config_for(&pki, 1, loopback(port_incumbent)))
+            .await
+            .unwrap();
+    incumbent
+        .add_address(1, PeerAddress::new(loopback(port_peer), TransportKind::Tcp))
+        .await;
+    wait_for_link(&peer, 2, TransportKind::Tcp).await;
+
+    let (impostor, _inbound_impostor) =
+        ConnectionManager::start(config_for(&pki, 1, loopback(port_impostor)))
+            .await
+            .unwrap();
+    impostor
+        .add_address(
+            1,
+            PeerAddress::new(loopback_v6(port_peer_v6), TransportKind::Tcp),
+        )
+        .await;
+
+    let evidence = wait_for_duplicate_identity(&impostor).await;
+    assert_eq!(
+        evidence.kind(),
+        crate::DuplicateIdentityEvidenceKind::RejectedByPeer
+    );
+    assert_eq!(evidence.reporter(), Some(1));
+    assert!(peer.has_live_transport_kind(2, TransportKind::Tcp));
+    assert_eq!(incumbent.duplicate_identity_evidence(), None);
+
+    impostor.shutdown().await;
+    incumbent.shutdown().await;
+    peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_peer_rejects_live_identity_from_new_endpoint() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_peer = pick_free_udp_port().await;
+    let port_peer_v6 = pick_free_udp_port().await;
+    let port_incumbent = pick_free_udp_port().await;
+    let port_impostor = pick_free_udp_port().await;
+    let cfg_peer =
+        config_with_quic(&pki, 0, loopback(port_peer)).with_quic_listen(loopback_v6(port_peer_v6));
+    let (peer, _inbound_peer) = ConnectionManager::start(cfg_peer).await.unwrap();
+    // Transport state alone cannot call a second session a duplicate: only an
+    // overlay knows which node ids are live neighbours. Install an oracle that
+    // reports node 2 as live, the way a running overlay would.
+    peer.set_identity_liveness_oracle(Some(Arc::new(|node| {
+        (node == 2).then_some((777u64, Duration::from_millis(50)))
+    })));
+    let (incumbent, _inbound_incumbent) =
+        ConnectionManager::start(config_with_quic(&pki, 1, loopback(port_incumbent)))
+            .await
+            .unwrap();
+    incumbent
+        .add_address(
+            1,
+            PeerAddress::new(loopback(port_peer), TransportKind::Quic),
+        )
+        .await;
+    wait_for_link(&peer, 2, TransportKind::Quic).await;
+
+    let (impostor, _inbound_impostor) =
+        ConnectionManager::start(config_with_quic(&pki, 1, loopback(port_impostor)))
+            .await
+            .unwrap();
+    impostor
+        .add_address(
+            1,
+            PeerAddress::new(loopback_v6(port_peer_v6), TransportKind::Quic),
+        )
+        .await;
+
+    let evidence = wait_for_duplicate_identity(&impostor).await;
+    assert_eq!(
+        evidence.kind(),
+        crate::DuplicateIdentityEvidenceKind::RejectedByPeer
+    );
+    assert_eq!(evidence.transport(), TransportKind::Quic);
+    assert_eq!(evidence.reporter(), Some(1));
+    assert!(peer.has_live_transport_kind(2, TransportKind::Quic));
+    assert_eq!(incumbent.duplicate_identity_evidence(), None);
+
+    impostor.shutdown().await;
+    incumbent.shutdown().await;
+    peer.shutdown().await;
+}
+
+/// A second session for a live node id from an endpoint the peer already
+/// knows (here: the incumbent's own IP) is a reconnect and is admitted.
+#[tokio::test]
+async fn peer_admits_live_identity_from_known_endpoint() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_peer = pick_free_port().await;
+    let port_incumbent = pick_free_port().await;
+    let port_reconnect = pick_free_port().await;
+    let (peer, _inbound_peer) = ConnectionManager::start(config_for(&pki, 0, loopback(port_peer)))
+        .await
+        .unwrap();
+    let (incumbent, _inbound_incumbent) =
+        ConnectionManager::start(config_for(&pki, 1, loopback(port_incumbent)))
+            .await
+            .unwrap();
+    incumbent
+        .add_address(1, PeerAddress::new(loopback(port_peer), TransportKind::Tcp))
+        .await;
+    wait_for_link(&peer, 2, TransportKind::Tcp).await;
+
+    let (reconnect, _inbound_reconnect) =
+        ConnectionManager::start(config_for(&pki, 1, loopback(port_reconnect)))
+            .await
+            .unwrap();
+    reconnect
+        .add_address(1, PeerAddress::new(loopback(port_peer), TransportKind::Tcp))
+        .await;
+    wait_for_link(&reconnect, 1, TransportKind::Tcp).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(reconnect.duplicate_identity_evidence(), None);
+    assert!(reconnect.has_live_transport_kind(1, TransportKind::Tcp));
+
+    reconnect.shutdown().await;
+    incumbent.shutdown().await;
+    peer.shutdown().await;
 }
 
 async fn wait_for_link(mgr: &ConnectionManager, node: u16, kind: TransportKind) {

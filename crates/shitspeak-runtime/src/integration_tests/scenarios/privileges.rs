@@ -3,12 +3,15 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::integration_tests::harness::{
     TestClient, TestServer, TestServerOpts, spawn_test_server,
 };
 use shitspeak_auth::Privilege;
 use shitspeak_messages::messages::Message;
-use shitspeak_messages::messages::encoder::{PermissionQuery, TextMessage, UserState};
+use shitspeak_messages::messages::encoder::{PermissionQuery, TextMessage, UserState, VoiceTarget};
+use shitspeak_proto::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use shitspeak_state::{ACL, ACLPermissions, Channel};
 
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -817,4 +820,156 @@ async fn hide_self_privilege_grants_the_hide_me_toggle() {
         .await
         .expect("the toggle switches back to Hide me");
     assert!(!live_carol.is_hidden_from_regular_users());
+}
+
+const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+
+async fn expect_voice_from(recipient: &TestClient, sender: &TestClient, what: &str) {
+    let audio = recipient
+        .recv_voice_tcp(DEADLINE)
+        .await
+        .unwrap_or_else(|| panic!("{what}"));
+    assert_eq!(audio.sender_session, Some(sender.server_session), "{what}");
+}
+
+async fn expect_no_voice(recipient: &TestClient, what: &str) {
+    let audio = recipient.recv_voice_tcp(QUIET).await;
+    assert!(audio.is_none(), "{what}: {audio:?}");
+}
+
+async fn move_and_wait(client: &TestClient, channel_id: u32) {
+    client.move_to_channel(channel_id).await;
+    expect_user_state(client, "the move should be confirmed", |state| {
+        state.session == Some(client.session_id) && state.channel_id == Some(channel_id)
+    })
+    .await;
+}
+
+/// Checks that `promiscuous` delivers normal speech and whispers from other
+/// channels exactly once, that a regular user in the same place hears none of
+/// it, and that deafening still silences the promiscuous user.
+#[tokio::test]
+async fn promiscuous_privilege_receives_all_voice_once() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    create_channel(&server, 51, "Talk").await;
+    create_channel(&server, 52, "Monitor").await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server.authenticator.register_privileged_user(
+        "eve",
+        None,
+        Some(3),
+        vec![],
+        [Privilege::Promiscuous],
+    );
+    server
+        .authenticator
+        .register_user("mallory", None, Some(4), vec![]);
+
+    let alice = connect(&server, "alice").await;
+    let bob = connect(&server, "bob").await;
+    let eve = connect(&server, "eve").await;
+    let mallory = connect(&server, "mallory").await;
+    move_and_wait(&alice, 51).await;
+    move_and_wait(&bob, 51).await;
+    move_and_wait(&eve, 52).await;
+    move_and_wait(&mallory, 52).await;
+    for client in [&alice, &bob, &eve, &mallory] {
+        client.drain_now().await;
+    }
+
+    alice
+        .send_voice_tcp(0, 1, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&bob, &alice, "bob shares alice's channel").await;
+    expect_voice_from(&eve, &alice, "eve hears speech in another channel").await;
+    expect_no_voice(&mallory, "mallory has no privilege").await;
+
+    alice
+        .set_voice_target(VoiceTarget {
+            id: Some(1),
+            targets: vec![VoiceTargetEntry {
+                session: vec![bob.session_id],
+                ..Default::default()
+            }],
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while live_client(&server, &alice).await.voice_target(1).is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "voice target installed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    alice
+        .send_voice_tcp(1, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&bob, &alice, "bob is the whisper target").await;
+    expect_voice_from(&eve, &alice, "eve hears whispers to others").await;
+    expect_no_voice(&mallory, "mallory is not a whisper target").await;
+
+    move_and_wait(&eve, 51).await;
+    eve.drain_now().await;
+    alice
+        .send_voice_tcp(0, 3, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&eve, &alice, "eve shares alice's channel").await;
+    expect_no_voice(&eve, "a regular recipient gets no second copy").await;
+
+    eve.set_self_deaf(true).await;
+    expect_user_state(&bob, "eve's self-deaf should be observed", |state| {
+        state.session == Some(eve.session_id) && state.self_deaf == Some(true)
+    })
+    .await;
+    move_and_wait(&eve, 52).await;
+    alice
+        .send_voice_tcp(0, 4, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&bob, &alice, "bob still hears alice").await;
+    expect_no_voice(&eve, "deafening silences promiscuous delivery").await;
+}
+
+/// Checks that a promiscuous user does not hear a sender hidden from them.
+#[tokio::test]
+async fn promiscuous_privilege_does_not_reveal_invisible_senders() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    create_channel(&server, 51, "Talk").await;
+    server.authenticator.register_privileged_user(
+        "ghost",
+        None,
+        Some(1),
+        vec![],
+        [Privilege::Invisible],
+    );
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server.authenticator.register_privileged_user(
+        "eve",
+        None,
+        Some(3),
+        vec![],
+        [Privilege::Promiscuous],
+    );
+
+    let ghost = connect(&server, "ghost").await;
+    let eve = connect(&server, "eve").await;
+    let bob = connect(&server, "bob").await;
+    move_and_wait(&bob, 51).await;
+    move_and_wait(&eve, 51).await;
+    eve.drain_now().await;
+
+    bob.send_voice_tcp(0, 1, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&eve, &bob, "eve hears a visible sender").await;
+
+    ghost
+        .send_voice_tcp(0, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(&eve, "invisible senders stay inaudible").await;
 }

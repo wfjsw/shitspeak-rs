@@ -1151,6 +1151,7 @@ fn udp_frame_kind_name(frame_type: i32) -> &'static str {
         Ok(pb::FrameType::FrameBye) => "transport.udp.frame.bye",
         Ok(pb::FrameType::FrameDictionary) => "transport.udp.frame.dictionary",
         Ok(pb::FrameType::FrameDictionaryAck) => "transport.udp.frame.dictionary_ack",
+        Ok(pb::FrameType::FrameDuplicateNode) => "transport.udp.frame.duplicate_node",
         Err(_) => "transport.udp.frame.unknown",
     }
 }
@@ -1595,6 +1596,12 @@ async fn handle_key_offer(
         &transcript,
         &offer.signature,
     )?;
+    // Same incumbent rule as the stream acceptors. UDP has no refusal notice;
+    // the duplicate's key exchange simply never completes.
+    if super::inbound_identity_conflict(inner, header.src, TransportKind::Udp, peer_addr).is_some()
+    {
+        return Ok(());
+    }
 
     let peer_offer = PeerKeyOffer {
         offer_id: header.seq,
@@ -3426,7 +3433,7 @@ async fn handle_frame(
             trace!(peer=%peer.node_id(), "received udp encrypted transport hello");
         }
         pb::FrameType::FrameDictionary | pb::FrameType::FrameDictionaryAck => {}
-        pb::FrameType::FrameBye => {}
+        pb::FrameType::FrameBye | pb::FrameType::FrameDuplicateNode => {}
     }
     Ok(())
 }

@@ -89,7 +89,19 @@ impl DuplicateDropSnapshot {
 #[derive(Debug)]
 struct EpochObservation {
     last_seen: Instant,
+    /// When a Hello or HelloAck for this epoch was last seen. Only these
+    /// prove a process is alive: an LSA may be relayed long after its origin
+    /// went away.
+    last_hello: Option<Instant>,
     tombstone: bool,
+}
+
+/// One live Hello/HelloAck observation of `boot_epoch`, aged relative to
+/// `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloObservation {
+    pub boot_epoch: u64,
+    pub age: Duration,
 }
 
 #[derive(Debug)]
@@ -154,10 +166,21 @@ impl DuplicateDetector {
             state.epochs.clear();
             state.quarantined_since = None;
         }
+        let from_hello = matches!(
+            _kind,
+            DuplicateEvidenceKind::Hello | DuplicateEvidenceKind::HelloAck
+        );
+        let previous = state.epochs.get(&boot_epoch);
+        let last_hello = if from_hello {
+            Some(now)
+        } else {
+            previous.and_then(|observation| observation.last_hello)
+        };
         state.epochs.insert(
             boot_epoch,
             EpochObservation {
                 last_seen: now,
+                last_hello,
                 tombstone,
             },
         );
@@ -166,6 +189,38 @@ impl DuplicateDetector {
             state.quarantined_since = Some(now);
             state.conflicts_total = state.conflicts_total.saturating_add(1);
         }
+    }
+
+    /// Live Hello/HelloAck observations for `node`, newest first.
+    ///
+    /// A returned age is measured at the moment of the call, so a requester
+    /// must treat it as an upper bound on staleness only after it has
+    /// translated it onto its own clock (see the identity probe).
+    pub fn hello_observations(&self, node: NodeIdentifier) -> Vec<HelloObservation> {
+        let now = Instant::now();
+        let mut states = self.states.lock();
+        let Some(state) = states.get_mut(&node) else {
+            return Vec::new();
+        };
+        prune_node_state(state, now, self.window);
+        let mut out: Vec<HelloObservation> = state
+            .epochs
+            .iter()
+            .filter(|(_, observation)| {
+                !observation.tombstone
+                    && observation
+                        .last_hello
+                        .is_some_and(|at| now.saturating_duration_since(at) <= self.window)
+            })
+            .map(|(boot_epoch, observation)| HelloObservation {
+                boot_epoch: *boot_epoch,
+                age: now.saturating_duration_since(
+                    observation.last_hello.unwrap_or(observation.last_seen),
+                ),
+            })
+            .collect();
+        out.sort_by_key(|observation| observation.age);
+        out
     }
 
     pub fn is_quarantined(&self, node: NodeIdentifier) -> bool {

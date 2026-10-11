@@ -30,6 +30,8 @@ mod distribution;
 pub(crate) mod distribution_metrics;
 mod duplicate;
 mod error;
+pub mod identity;
+pub mod identity_guard;
 mod inbound;
 mod lane;
 pub mod lsdb;
@@ -40,8 +42,10 @@ pub(crate) mod ordering_metrics;
 pub(crate) mod proto;
 pub mod routing;
 mod runtime;
+pub use runtime::reserve_boot_epoch_floor;
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -162,7 +166,9 @@ fn max_replication_payload_bytes_for_frame(
 }
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
-pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
+pub use duplicate::{
+    DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot, HelloObservation,
+};
 pub use error::OverlayError;
 pub use lane::LaneId;
 pub use lsdb::{ApplicationServices, ReplicationServices, STRICT_REPLICATION_PROTOCOL_VERSION};
@@ -362,6 +368,7 @@ impl VoiceRouteQuality {
 pub struct StartupDuplicateEvidence {
     source: NodeIdentifier,
     kind: &'static str,
+    remote: Option<SocketAddr>,
 }
 
 impl StartupDuplicateEvidence {
@@ -372,8 +379,292 @@ impl StartupDuplicateEvidence {
     pub fn kind(&self) -> &'static str {
         self.kind
     }
+
+    /// Remote socket of the connection that produced the evidence, if known.
+    pub fn remote(&self) -> Option<SocketAddr> {
+        self.remote
+    }
 }
 
+/// Test-only: emulate a node that predates duplicate-identity detection, so
+/// a scenario can replay an incident where a duplicate slipped in before this
+/// check existed.
+///
+/// This is compiled out of the production binary — it is only reachable with
+/// the `test-support` feature — and is a process-wide switch, so callers must
+/// hold the network test guard across the set/spawn/clear window.
+#[cfg(any(test, feature = "test-support"))]
+static EMULATE_LEGACY_IDENTITY_PREFLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn emulate_legacy_identity_preflight(enabled: bool) {
+    EMULATE_LEGACY_IDENTITY_PREFLIGHT.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Startup check against the transport's own evidence. A process holding our
+/// identity is found by the initial seed dials (a dial reaching a remote
+/// process presenting our certificate) or by a peer refusing our session in
+/// favour of a live incumbent. Waits for those dials, bounded by the
+/// transport, plus `settle` for refusal notices still in flight.
+pub async fn duplicate_startup_identity_preflight(
+    local_node: NodeIdentifier,
+    transport: &ConnectionManager,
+    inbound: Inbound,
+    _boot_start: std::time::Instant,
+    settle: Duration,
+    hello_interval: Duration,
+    hello_dead_interval: Duration,
+) -> (Inbound, Option<StartupDuplicateEvidence>) {
+    #[cfg(any(test, feature = "test-support"))]
+    if EMULATE_LEGACY_IDENTITY_PREFLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return (inbound, None);
+    }
+    let (mut control, mut high, mut regular) = inbound.into_parts();
+
+    // Refusal needs proof the competitor is live **on the overlay**, and that
+    // it is not this node's own just-torn-down incarnation. A single
+    // observation cannot show either: a lingering hello from the previous
+    // incarnation looks exactly like a competitor's until it goes stale.
+    // So a competitor is proven only when the same boot epoch is reported
+    // live at two moments a hello interval apart — a dead predecessor stops
+    // being reported, a live impostor keeps refreshing.
+    let mut live = LiveSightings::new(hello_interval, hello_dead_interval);
+
+    // The seed dials are what reach a process already holding our identity;
+    // keep probing past them so a refusal notice or a probe answer in flight
+    // still lands, but never wait out the whole dial bound on a clean boot.
+    let settle = settle.max(hello_interval.saturating_mul(2));
+    let hard_deadline = tokio::time::Instant::now() + transport.initial_seed_dial_bound();
+    let mut deadline = tokio::time::Instant::now() + settle;
+    // Sample faster than the hello period so a refreshed hello is actually
+    // observed between two probes instead of aliasing to a constant.
+    let probe_every = (hello_interval / 2).max(Duration::from_millis(50));
+    let mut next_probe = tokio::time::Instant::now();
+    let mut nonce = 1u64;
+    let mut evidence: Option<StartupDuplicateEvidence> = None;
+
+    while evidence.is_none() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline.min(hard_deadline) {
+            break;
+        }
+        if now >= next_probe {
+            for (peer, _) in transport.live_peers() {
+                if peer == local_node {
+                    continue;
+                }
+                if identity::send_identity_probe(transport, local_node, peer, local_node, nonce)
+                    .await
+                    .is_some()
+                {
+                    nonce = nonce.wrapping_add(1).max(1);
+                }
+            }
+            next_probe = now + probe_every;
+        }
+
+        let wait = (next_probe.min(deadline)).saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Some(msg)) = timeout(
+            wait.max(Duration::from_millis(5)),
+            recv_preflight_any(&mut control, &mut high, &mut regular),
+        )
+        .await
+        {
+            if let Some(response) = identity::IdentityProbeResponse::decode(msg.payload()) {
+                if response.subject == local_node
+                    && live.observe_report(msg.from(), &response.hello_epochs, "identity_probe")
+                {
+                    evidence = Some(StartupDuplicateEvidence {
+                        source: msg.from(),
+                        kind: "identity_probe",
+                        remote: None,
+                    });
+                }
+            } else if let Some(found) = startup_duplicate_evidence(local_node, &msg) {
+                // A Hello/HelloAck carrying our own node id is arriving now,
+                // from another process speaking for us on the overlay.
+                evidence = Some(StartupDuplicateEvidence {
+                    source: found.source,
+                    kind: found.kind,
+                    remote: found.remote,
+                });
+            }
+        }
+
+        // A peer refusal counts when the peer attested overlay liveness of
+        // the competing identity. The incumbent's node id is our own, so the
+        // attested epoch is the competitor's.
+        if let Some(report) = transport.duplicate_identity_evidence() {
+            if let Some(attestation) = report.attestation() {
+                let observation = identity::ReportedObservation {
+                    boot_epoch: attestation.boot_epoch,
+                    age: attestation.hello_age,
+                };
+                if live.observe_report(
+                    report.reporter().unwrap_or(local_node),
+                    std::slice::from_ref(&observation),
+                    report.kind().label(),
+                ) {
+                    evidence = Some(StartupDuplicateEvidence {
+                        source: report.reporter().unwrap_or(local_node),
+                        kind: report.kind().label(),
+                        remote: report.remote(),
+                    });
+                }
+            }
+        }
+
+        // A sighting is only half a proof, so give the second one room to
+        // land. The extension is anchored at the first sighting, so it is a
+        // bounded wait rather than an open-ended one.
+        if let Some(first) = live.first_sighting_at() {
+            let proof_window = hello_interval
+                .saturating_mul(2)
+                .saturating_add(probe_every.saturating_mul(2));
+            let needed = tokio::time::Instant::from_std(first) + proof_window;
+            deadline = deadline.max(needed);
+        }
+    }
+
+    if evidence.is_none() && !transport.initial_seed_dials_finished() {
+        let bound = transport.initial_seed_dial_bound();
+        if !transport.wait_initial_seed_dials(bound).await {
+            tracing::info!(
+                ?bound,
+                "duplicate startup preflight: initial seed dials still pending; continuing"
+            );
+        }
+    }
+    (Inbound::new(control, high, regular), evidence)
+}
+
+/// Tracks overlay-liveness sightings of foreign boot epochs.
+///
+/// A recent observation alone proves nothing: a process that died seconds ago
+/// leaves hellos that are still inside `hello_dead_interval`. What separates a
+/// live competitor from a departed predecessor is whether the reported hello
+/// age is being *refreshed*. For a dead process the age grows in lockstep with
+/// the wall clock; for a live one the hello stream keeps it cycling.
+///
+/// `observe_report` therefore returns true only when the same peer has
+/// reported the same epoch with a strictly smaller age than before — a newer
+/// hello arrived between that peer's two sightings.
+struct LiveSightings {
+    hello_dead_interval: Duration,
+    /// First sighting time and the most recent age, per (reporting peer, epoch).
+    ///
+    /// Keyed by peer as well as epoch: each peer reports its own view of a
+    /// hello's age, so two peers' reports of the same epoch are not
+    /// comparable. Only one peer reporting a fresher hello than it did before
+    /// means that peer saw a new hello arrive.
+    seen: std::collections::HashMap<(NodeIdentifier, u64), (std::time::Instant, Duration)>,
+}
+
+impl LiveSightings {
+    fn new(_hello_interval: Duration, hello_dead_interval: Duration) -> Self {
+        Self {
+            hello_dead_interval,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// When the first live observation was recorded.
+    fn first_sighting_at(&self) -> Option<std::time::Instant> {
+        self.seen.values().map(|(at, _)| *at).min()
+    }
+
+    fn observe_report(
+        &mut self,
+        source: NodeIdentifier,
+        observations: &[identity::ReportedObservation],
+        kind: &str,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        for observation in observations {
+            // A stale hello says nothing about who is alive now.
+            if observation.age > self.hello_dead_interval {
+                continue;
+            }
+            tracing::warn!(
+                %source,
+                kind,
+                boot_epoch = observation.boot_epoch,
+                hello_age_ms = observation.age.as_millis() as u64,
+                "startup preflight: live overlay observation of this node id"
+            );
+            match self.seen.entry((source, observation.boot_epoch)) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let (first_at, previous_age) = *entry.get();
+                    if observation.age < previous_age {
+                        // The hello stream refreshed between this peer's two
+                        // sightings: the process is alive. A departed
+                        // predecessor only ages in lockstep with the wall
+                        // clock, so it can never satisfy this.
+                        return true;
+                    }
+                    entry.insert((first_at, observation.age));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((now, observation.age));
+                }
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod live_sightings_tests {
+    use super::{Duration, LiveSightings};
+
+    fn reported(boot_epoch: u64, age_ms: u64) -> crate::overlay::identity::ReportedObservation {
+        crate::overlay::identity::ReportedObservation {
+            boot_epoch,
+            age: Duration::from_millis(age_ms),
+        }
+    }
+
+    #[test]
+    fn a_peer_reporting_a_refreshed_hello_proves_the_competitor_is_alive() {
+        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(800));
+        assert!(!live.observe_report(1, &[reported(500, 300)], "probe"));
+        // The same peer saw a newer hello: age went down.
+        assert!(live.observe_report(1, &[reported(500, 40)], "probe"));
+    }
+
+    #[test]
+    fn two_peers_views_of_one_epoch_are_not_comparable() {
+        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(800));
+        // Peer 2 saw the hello long ago; peer 1 saw it recently. That is not a
+        // refresh — it is two peers disagreeing about a departed node.
+        assert!(!live.observe_report(2, &[reported(500, 5_000)], "probe"));
+        assert!(!live.observe_report(1, &[reported(500, 5_000)], "probe"));
+        assert!(!live.observe_report(2, &[reported(500, 100)], "probe"));
+        assert!(!live.observe_report(1, &[reported(500, 30)], "probe"));
+    }
+
+    #[test]
+    fn a_departed_predecessor_ages_in_lockstep_and_never_proves_liveness() {
+        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(5_000));
+        let mut age_ms = 50u64;
+        for _ in 0..20 {
+            assert!(
+                !live.observe_report(1, &[reported(700, age_ms)], "probe"),
+                "a growing age must not prove liveness"
+            );
+            age_ms += 200;
+        }
+    }
+
+    #[test]
+    fn observations_older_than_the_dead_interval_are_ignored() {
+        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(800));
+        assert!(!live.observe_report(1, &[reported(500, 5_000)], "probe"));
+        assert!(!live.observe_report(1, &[reported(500, 10)], "probe"));
+        assert!(live.first_sighting_at().is_some());
+    }
+}
 pub async fn duplicate_startup_preflight(
     local_node: NodeIdentifier,
     inbound: Inbound,
@@ -424,6 +715,7 @@ fn startup_duplicate_evidence(
         return Some(StartupDuplicateEvidence {
             source: msg.from(),
             kind: "transport_peer",
+            remote: None,
         });
     }
     let decoded = proto::decode_message(msg.payload()).ok()?;
@@ -435,6 +727,7 @@ fn startup_duplicate_evidence(
             Some(StartupDuplicateEvidence {
                 source: msg.from(),
                 kind: "hello",
+                remote: None,
             })
         }
         proto::OverlayBody::HelloAck(ack)
@@ -443,6 +736,7 @@ fn startup_duplicate_evidence(
             Some(StartupDuplicateEvidence {
                 source: msg.from(),
                 kind: "hello_ack",
+                remote: None,
             })
         }
         _ => None,
@@ -731,6 +1025,19 @@ impl OverlayNetwork {
     }
 
     /// Snapshot of duplicate node-id observations and quarantine state.
+    /// Requests from the identity guard to re-incarnate this node's S2S
+    /// stack with an epoch above an impostor's.
+    pub fn reincarnation_requests(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<identity_guard::ReincarnationRequest>> {
+        self.inner.identity_guard.reincarnation_requests()
+    }
+
+    /// The identity guard itself, for metrics and tests.
+    pub fn identity_guard(&self) -> &Arc<identity_guard::IdentityGuard> {
+        &self.inner.identity_guard
+    }
+
     pub fn duplicate_node_snapshot(&self) -> Vec<DuplicateNodeSnapshot> {
         self.inner.duplicate_detector.snapshot()
     }

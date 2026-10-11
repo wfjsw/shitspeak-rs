@@ -34,6 +34,10 @@ use super::connection::{
 };
 use super::connection::{DATAGRAM_LANE_SHED_HARD_THRESHOLD, DATAGRAM_LANE_SHED_THRESHOLD};
 use super::connection::{OutboundEnvelope, TransportPayloadPlan};
+use super::duplicate_identity::{
+    DuplicateIdentityEvidence, DuplicateIdentitySignal, IdentityLivenessOracle, InitialSeedDials,
+    SELF_LOOP_ACCEPT_GRACE, SelfLoopRegistry,
+};
 use super::endpoint::{
     EndpointRegistry,
     kcp::KcpEndpoint,
@@ -255,6 +259,7 @@ pub(crate) struct InboundDispatch {
     control_watermark: Arc<Mutex<QueueWatermark>>,
     high_watermark: Arc<Mutex<QueueWatermark>>,
     regular_watermark: Arc<Mutex<QueueWatermark>>,
+    duplicate_identity: Arc<DuplicateIdentitySignal>,
 }
 
 impl InboundDispatch {
@@ -271,7 +276,13 @@ impl InboundDispatch {
             control_watermark: Arc::new(Mutex::new(QueueWatermark::new(now))),
             high_watermark: Arc::new(Mutex::new(QueueWatermark::new(now))),
             regular_watermark: Arc::new(Mutex::new(QueueWatermark::new(now))),
+            duplicate_identity: Arc::new(DuplicateIdentitySignal::new()),
         }
+    }
+
+    /// Evidence sink shared by every pump of this manager.
+    pub(crate) fn duplicate_identity(&self) -> &Arc<DuplicateIdentitySignal> {
+        &self.duplicate_identity
     }
 
     pub fn dispatch(&self, msg: InboundMessage) {
@@ -424,6 +435,12 @@ pub(crate) struct ManagerInner {
     seed_backoff: Arc<SccMap<SeedAddress, Arc<parking_lot::Mutex<BackoffState>>>>,
     successful_seeds: Arc<SccMap<SeedAddress, PeerAddress>>,
     quarantined_self_seeds: Arc<SccMap<SeedAddress, Instant>>,
+    self_loops: Arc<SelfLoopRegistry>,
+    initial_seed_dials: Arc<InitialSeedDials>,
+    /// Installed by the overlay. Without it the transport has no basis
+    /// for calling a session a duplicate: only the overlay knows which
+    /// node ids are live neighbours.
+    identity_liveness_oracle: Arc<parking_lot::RwLock<Option<IdentityLivenessOracle>>>,
     required_outgoing: Arc<RwLock<HashSet<NodeIdentifier>>>,
     inbound: InboundDispatch,
     shutdown: CancellationToken,
@@ -452,6 +469,20 @@ impl ManagerInner {
 
     pub fn endpoints(&self) -> &EndpointRegistry {
         &self.endpoints
+    }
+
+    pub(crate) fn self_loops(&self) -> &SelfLoopRegistry {
+        &self.self_loops
+    }
+
+    pub(crate) fn initial_seed_dials(&self) -> &InitialSeedDials {
+        &self.initial_seed_dials
+    }
+
+    /// Overlay liveness of `node`, or `None` when it is not a live
+    /// overlay neighbour (or no oracle is installed).
+    pub(crate) fn overlay_liveness(&self, node: NodeIdentifier) -> Option<(u64, Duration)> {
+        self.identity_liveness_oracle.read().as_ref()?(node)
     }
 
     pub fn get_or_create_peer(&self, id: NodeIdentifier) -> Arc<PeerState> {
@@ -502,6 +533,9 @@ impl ManagerInner {
             seed_backoff: self.seed_backoff.clone(),
             successful_seeds: self.successful_seeds.clone(),
             quarantined_self_seeds: self.quarantined_self_seeds.clone(),
+            self_loops: self.self_loops.clone(),
+            initial_seed_dials: self.initial_seed_dials.clone(),
+            identity_liveness_oracle: self.identity_liveness_oracle.clone(),
             required_outgoing: self.required_outgoing.clone(),
             inbound: self.inbound.clone(),
             shutdown: self.shutdown.clone(),
@@ -1031,6 +1065,9 @@ impl ConnectionManager {
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
             quarantined_self_seeds: Arc::new(SccMap::new()),
+            self_loops: Arc::new(SelfLoopRegistry::default()),
+            initial_seed_dials: Arc::new(InitialSeedDials::default()),
+            identity_liveness_oracle: Arc::new(parking_lot::RwLock::new(None)),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
             inbound,
             shutdown: CancellationToken::new(),
@@ -1041,7 +1078,9 @@ impl ConnectionManager {
         });
 
         super::endpoint::start_all(inner.clone()).await?;
-        for addr in inner.cfg().seed_targets() {
+        let seed_targets = inner.cfg().seed_targets();
+        inner.initial_seed_dials().begin(seed_targets.len());
+        for addr in seed_targets {
             let inner_c = inner.clone();
             tokio::spawn(async move {
                 match super::endpoint::probe_seed_address(&inner_c, addr.clone()).await {
@@ -1049,6 +1088,7 @@ impl ConnectionManager {
                     Some(Err(e)) => debug!(?addr, error=%e, "initial seed dial failed"),
                     None => {}
                 }
+                inner_c.initial_seed_dials().finish_one();
             });
         }
         tokio::spawn(super::endpoint::run_supervisor(inner.clone()));
@@ -1104,6 +1144,9 @@ impl ConnectionManager {
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
             quarantined_self_seeds: Arc::new(SccMap::new()),
+            self_loops: Arc::new(SelfLoopRegistry::default()),
+            initial_seed_dials: Arc::new(InitialSeedDials::default()),
+            identity_liveness_oracle: Arc::new(parking_lot::RwLock::new(None)),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
             inbound,
             shutdown: CancellationToken::new(),
@@ -1145,6 +1188,43 @@ impl ConnectionManager {
             false,
         ));
         rx
+    }
+
+    /// Upper bound on how long the initial seed dials can take, including
+    /// resolution and self-loop classification.
+    pub fn initial_seed_dial_bound(&self) -> Duration {
+        super::endpoint::SEED_RESOLVE_TIMEOUT
+            .saturating_add(self.inner.cfg().dial_attempt_timeout())
+            .saturating_add(SELF_LOOP_ACCEPT_GRACE)
+    }
+
+    /// Whether the seed dials issued at startup have all finished.
+    pub fn initial_seed_dials_finished(&self) -> bool {
+        self.inner.initial_seed_dials().finished()
+    }
+
+    /// Wait for the seed dials issued at startup. Returns false on timeout.
+    pub async fn wait_initial_seed_dials(&self, timeout: Duration) -> bool {
+        self.inner.initial_seed_dials().wait(timeout).await
+    }
+
+    /// Install or clear the overlay liveness oracle.
+
+    /// Without it no inbound session is ever treated as a duplicate, because
+    /// transport state alone cannot say who is alive on the overlay.
+    pub fn set_identity_liveness_oracle(&self, oracle: Option<IdentityLivenessOracle>) {
+        *self.inner.identity_liveness_oracle.write() = oracle;
+    }
+
+    /// First evidence that another live process holds this node's identity.
+    pub fn duplicate_identity_evidence(&self) -> Option<DuplicateIdentityEvidence> {
+        self.inner.inbound().duplicate_identity().current()
+    }
+
+    pub fn subscribe_duplicate_identity(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DuplicateIdentityEvidence>> {
+        self.inner.inbound().duplicate_identity().subscribe()
     }
 
     pub fn local_node_id(&self) -> NodeIdentifier {

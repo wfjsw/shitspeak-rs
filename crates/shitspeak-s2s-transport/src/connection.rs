@@ -2016,6 +2016,58 @@ impl PeerState {
         })
     }
 
+    /// The remote address of a live session for this node id when `candidate`
+    /// comes from an endpoint this peer has never been known at. Two live
+    /// processes then claim one identity; the incumbent keeps it. A candidate
+    /// from a known endpoint (address book, advertisement, an observed or live
+    /// session IP, or the same IPv6 /64) is a reconnect, not a duplicate.
+    pub(crate) fn live_incumbent_for_new_endpoint(
+        &self,
+        candidate: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let candidate_ip = canonical_ip(candidate.ip());
+        let live_remotes: Vec<SocketAddr> = {
+            let mut streams = self.stream_entries();
+            prune_dead_streams(&mut streams);
+            streams
+                .values()
+                .filter(|stream| stream.is_alive())
+                .filter_map(|stream| stream.remote_addr)
+                .collect()
+        };
+        let incumbent = *live_remotes
+            .iter()
+            .find(|remote| !same_endpoint_host(canonical_ip(remote.ip()), candidate_ip))?;
+        if live_remotes
+            .iter()
+            .any(|remote| same_endpoint_host(canonical_ip(remote.ip()), candidate_ip))
+            || self.endpoint_ip_is_known(candidate_ip)
+        {
+            return None;
+        }
+        Some(incumbent)
+    }
+
+    fn endpoint_ip_is_known(&self, ip: IpAddr) -> bool {
+        let known = |candidate: IpAddr| same_endpoint_host(canonical_ip(candidate), ip);
+        self.addresses
+            .lock()
+            .iter()
+            .any(|addr| known(addr.addr().ip()))
+            || self
+                .advertised_addresses
+                .lock()
+                .iter()
+                .any(|addr| known(addr.addr().ip()))
+            || self
+                .observed_remote_ips
+                .lock()
+                .values()
+                .flatten()
+                .any(|observed| known(*observed))
+            || self.udp_addr.lock().is_some_and(|addr| known(addr.ip()))
+    }
+
     pub fn address_is_currently_confirmed(&self, addr: PeerAddress) -> bool {
         self.address_is_actively_advertised(addr) || self.address_matches_live_remote_ip(addr)
     }
@@ -3537,6 +3589,16 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whether two canonical IPs belong to the same endpoint host. IPv6 hosts
+/// rotate interface identifiers inside their /64, so the prefix identifies
+/// the host.
+fn same_endpoint_host(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V6(a), IpAddr::V6(b)) => a.octets()[..8] == b.octets()[..8],
+        _ => a == b,
+    }
+}
+
 pub(crate) fn retry_cap_for_last_seen_age(
     last_seen_age: Option<Duration>,
     recent_cap: Duration,
@@ -4606,6 +4668,70 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn live_incumbent_rejects_identity_from_new_endpoint() {
+        let peer = peer_for_address_tests();
+        let incumbent: SocketAddr = "198.51.100.7:50000".parse().unwrap();
+        let (stream, _rx) = active_stream_for_test(TransportKind::Tcp, incumbent, false);
+        assert!(peer.try_install_stream(stream).is_ok());
+
+        assert_eq!(
+            peer.live_incumbent_for_new_endpoint("203.0.113.9:41000".parse().unwrap()),
+            Some(incumbent)
+        );
+    }
+
+    #[test]
+    fn live_incumbent_admits_identity_from_known_endpoints() {
+        let peer = peer_for_address_tests();
+        let incumbent: SocketAddr = "198.51.100.7:50000".parse().unwrap();
+        let (stream, _rx) = active_stream_for_test(TransportKind::Tcp, incumbent, false);
+        assert!(peer.try_install_stream(stream).is_ok());
+        peer.add_address(PeerAddress::new(
+            "192.0.2.10:64801".parse().unwrap(),
+            TransportKind::Kcp,
+        ));
+        peer.replace_advertised_addresses(&[PeerAddress::new(
+            "[2001:db8:1:2::1]:64801".parse().unwrap(),
+            TransportKind::Quic,
+        )]);
+        peer.note_observed_remote_addr(TransportKind::Udp, "192.0.2.20:9".parse().unwrap());
+
+        for known in [
+            // Another session from the incumbent's own host.
+            "198.51.100.7:50001",
+            // Address-book IP on another transport and port.
+            "192.0.2.10:1234",
+            // Same IPv6 /64 as an advertised address.
+            "[2001:db8:1:2::abcd]:5000",
+            // IPv4-mapped form of an observed IP.
+            "[::ffff:192.0.2.20]:5000",
+        ] {
+            assert_eq!(
+                peer.live_incumbent_for_new_endpoint(known.parse().unwrap()),
+                None,
+                "{known} is a known endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_without_live_incumbent_is_admitted_from_any_endpoint() {
+        let peer = peer_for_address_tests();
+        let (stream, _rx) = active_stream_for_test(
+            TransportKind::Tcp,
+            "198.51.100.7:50000".parse().unwrap(),
+            false,
+        );
+        assert!(peer.try_install_stream(stream).is_ok());
+        peer.drop_stream(TransportKind::Tcp);
+
+        assert_eq!(
+            peer.live_incumbent_for_new_endpoint("203.0.113.9:41000".parse().unwrap()),
+            None
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::testing::{
 };
 use crate::{application::VOICE_SERVICE_TAG, status::prometheus_samples};
 use shitspeak_s2s_transport::{
-    ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
+    ConnectionManager, MessageClass, PeerAddress, SeedAddress, ServiceLevel, TransportKind,
 };
 
 use crate::overlay::{
@@ -1270,4 +1270,95 @@ async fn distribution_tree_lost_candidate_ack_keeps_active_tree_delivering() {
     );
 
     cluster.shutdown_all().await;
+}
+
+/// A dial that reaches another process holding our certificate proves only
+/// that the certificate is in use — the process may be long gone. Without an
+/// overlay liveness statement it must not refuse the boot.
+#[tokio::test]
+async fn startup_preflight_ignores_a_bare_remote_self_loop() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[2]);
+    let port_incumbent = pick_free_port().await;
+    let port_newcomer = pick_free_port().await;
+    let (incumbent, _incumbent_inbound) =
+        ConnectionManager::start(transport_cfg(&pki, 0, loopback(port_incumbent)))
+            .await
+            .unwrap();
+    let (newcomer, newcomer_inbound) = ConnectionManager::start(
+        transport_cfg(&pki, 0, loopback(port_newcomer)).with_seed_target(SeedAddress::new(
+            loopback(port_incumbent).to_string(),
+            TransportKind::Tcp,
+        )),
+    )
+    .await
+    .unwrap();
+
+    let (_inbound, evidence) = crate::overlay::duplicate_startup_identity_preflight(
+        2,
+        &newcomer,
+        newcomer_inbound,
+        std::time::Instant::now(),
+        Duration::from_millis(3_000),
+        Duration::from_millis(200),
+        Duration::from_millis(800),
+    )
+    .await;
+
+    // The transport did see the impostor...
+    assert!(newcomer.duplicate_identity_evidence().is_some());
+    // ...but nothing attested overlay liveness, so the boot proceeds.
+    assert!(
+        evidence.is_none(),
+        "a bare remote self-loop must not refuse the boot: {evidence:?}"
+    );
+
+    newcomer.shutdown().await;
+    incumbent.shutdown().await;
+}
+
+/// A clean boot passes the startup preflight as soon as its seed dial
+/// completes, without waiting out the dial bound.
+#[tokio::test]
+async fn startup_preflight_passes_unique_identity() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_seed = pick_free_port().await;
+    let port_newcomer = pick_free_port().await;
+    let (seed, _seed_inbound) =
+        ConnectionManager::start(transport_cfg(&pki, 0, loopback(port_seed)))
+            .await
+            .unwrap();
+    let (newcomer, newcomer_inbound) = ConnectionManager::start(
+        transport_cfg(&pki, 1, loopback(port_newcomer)).with_seed_target(SeedAddress::new(
+            loopback(port_seed).to_string(),
+            TransportKind::Tcp,
+        )),
+    )
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let (_inbound, evidence) = crate::overlay::duplicate_startup_identity_preflight(
+        2,
+        &newcomer,
+        newcomer_inbound,
+        std::time::Instant::now(),
+        Duration::from_millis(250),
+        Duration::from_millis(200),
+        Duration::from_millis(800),
+    )
+    .await;
+
+    assert!(evidence.is_none(), "unexpected evidence: {evidence:?}");
+    assert!(
+        started.elapsed() < newcomer.initial_seed_dial_bound(),
+        "preflight waited out the bound: {:?}",
+        started.elapsed()
+    );
+
+    newcomer.shutdown().await;
+    seed.shutdown().await;
 }

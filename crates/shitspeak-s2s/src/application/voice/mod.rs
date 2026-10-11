@@ -19,5 +19,6 @@ pub use ingress::{VoiceInbound, VoiceService};
 pub use send::{OverlayVoiceTransport, VOICE_CLASS, VOICE_LEVEL, VoiceTransport, build_envelope};
 pub use sink::AudioSink;
 pub use targeted::{
-    RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot, RecipientIndexUpdate,
+    PromiscuousNodes, RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot,
+    RecipientIndexUpdate,
 };

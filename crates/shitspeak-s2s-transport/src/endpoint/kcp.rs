@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Instant;
 use std::sync::Arc;
 
 use rustls_pki_types::ServerName;
@@ -19,8 +20,9 @@ use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
 use super::{
-    Endpoint, install_stream_session,
+    Endpoint, classify_dialed_self_loop, inbound_identity_conflict, install_stream_session,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxSet},
+    reject_accepted_self_loop, reject_duplicate_identity_stream, tls_self_loop_exporter,
 };
 
 const KCP_MAX_LISTENER_SESSIONS: usize = 512;
@@ -83,6 +85,7 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> io::Result<()> {
         let cfg = kcp_config(self.kcp_tuning);
+        let dial_started_at = Instant::now();
         let sock = connect_kcp_stream(&cfg, addr)
             .await
             .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
@@ -97,6 +100,12 @@ impl Endpoint for KcpEndpoint {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
         let peer_node = parse_peer_cn(chain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node == inner.self_id() {
+            let exporter = tls_self_loop_exporter(&**client);
+            return Err(
+                classify_dialed_self_loop(&inner, TransportKind::Kcp, addr, exporter).await,
+            );
+        }
         if peer_node != peer.node_id() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -112,6 +121,7 @@ impl Endpoint for KcpEndpoint {
             TransportKind::Kcp,
             Some(addr),
             true,
+            Some(dial_started_at),
             tls,
             native_sampler,
         );
@@ -124,6 +134,7 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> io::Result<crate::types::NodeIdentifier> {
         let cfg = kcp_config(self.kcp_tuning);
+        let dial_started_at = Instant::now();
         let sock = connect_kcp_stream(&cfg, addr)
             .await
             .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
@@ -138,10 +149,10 @@ impl Endpoint for KcpEndpoint {
         let peer_node = parse_peer_cn(chain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
         if peer_node == inner.self_id() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "self-loop rejected",
-            ));
+            let exporter = tls_self_loop_exporter(&**client);
+            return Err(
+                classify_dialed_self_loop(&inner, TransportKind::Kcp, addr, exporter).await,
+            );
         }
         install_stream_session(
             &inner,
@@ -149,6 +160,7 @@ impl Endpoint for KcpEndpoint {
             TransportKind::Kcp,
             Some(addr),
             true,
+            Some(dial_started_at),
             tls,
             native_sampler,
         );
@@ -222,7 +234,7 @@ async fn handle_inbound(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     let native_sampler = native_stats::kcp_sampler(&sock);
-    let tls = acceptor.accept(sock).await?;
+    let mut tls = acceptor.accept(sock).await?;
     let (_, server) = tls.get_ref();
     let chain = server
         .peer_certificates()
@@ -230,10 +242,18 @@ async fn handle_inbound(
     let peer_node = parse_peer_cn(chain)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if peer_node == inner.self_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "self-loop rejected",
+        return Err(reject_accepted_self_loop(
+            &inner,
+            tls_self_loop_exporter(&**server),
         ));
+    }
+    if let Some(conflict) =
+        inbound_identity_conflict(&inner, peer_node, TransportKind::Kcp, peer_addr)
+    {
+        return Err(reject_duplicate_identity_stream(
+            &inner, &mut tls, peer_node, peer_addr, conflict,
+        )
+        .await);
     }
     inner
         .get_or_create_peer(peer_node)
@@ -244,6 +264,7 @@ async fn handle_inbound(
         TransportKind::Kcp,
         Some(peer_addr),
         false,
+        None,
         tls,
         native_sampler,
     );

@@ -1021,6 +1021,8 @@ pub struct LinkStateDb {
     floor: Arc<LsaFloor>,
     change_signal: Notify,
     dirty_origins: RwLock<HashSet<NodeIdentifier>>,
+    /// Optional identity guard reached from the LSA paths.
+    identity_guard: RwLock<Option<Arc<super::super::identity_guard::IdentityGuard>>>,
 }
 
 fn distribution_epoch_hash_value(hash: &mut u64, value: u64) {
@@ -1037,7 +1039,39 @@ impl LinkStateDb {
             floor,
             change_signal: Notify::new(),
             dirty_origins: RwLock::new(HashSet::new()),
+            identity_guard: RwLock::new(None),
         }
+    }
+
+    /// This node's own id, from the floor.
+    pub fn local_node_id(&self) -> NodeIdentifier {
+        self.floor.local_node_id
+    }
+
+    /// Install the identity guard so the LSA paths can report conflicts.
+    pub fn set_identity_guard(
+        &self,
+        guard: Arc<super::super::identity_guard::IdentityGuard>,
+    ) {
+        *self.identity_guard.write() = Some(guard);
+    }
+
+    pub fn identity_guard(
+        &self,
+    ) -> Option<Arc<super::super::identity_guard::IdentityGuard>> {
+        self.identity_guard.read().clone()
+    }
+
+    /// The `(boot_epoch, seq)` this node holds for `origin`, preferring the
+    /// live entry and falling back to the persisted floor.
+    pub fn known_version(&self, origin: NodeIdentifier) -> Option<OriginVersion> {
+        if let Some(entry) = self.get(origin) {
+            return Some(OriginVersion {
+                boot_epoch: entry.boot_epoch,
+                seq: entry.seq,
+            });
+        }
+        self.floor.get(origin)
     }
 
     pub fn floor(&self) -> &Arc<LsaFloor> {

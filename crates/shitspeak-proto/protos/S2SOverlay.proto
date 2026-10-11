@@ -14,7 +14,54 @@ message OverlayMessage {
     LsdbSyncResp  lsdb_sync_resp = 5;   // response: LSAs requester is missing/stale
     OverlayData   data           = 6;
     OverlayControl control       = 7;
+    // Ask a directly-connected peer what it knows about one node id's
+    // liveness, before deciding to refuse a boot. No boot epoch is carried,
+    // so a probe can never feed the receiver's duplicate detector.
+    IdentityProbe     identity_probe      = 8;
+    IdentityProbeResp identity_probe_resp = 9;
+    // Sent back to the origin of a directly-delivered LSA when our own
+    // (boot_epoch, seq) for that origin is strictly higher, so the origin
+    // learns it is fenced and cannot reach the overlay under this epoch.
+    OriginFenced      origin_fenced       = 10;
   }
+}
+
+// One observation of a Hello/HelloAck for `subject` at `boot_epoch`.
+// `age_us` is how long before this response was built the observation was
+// made, so a requester can translate it into its own clock.
+message HelloObservation {
+  uint64 boot_epoch = 1;
+  uint64 age_us     = 2;
+}
+
+// Identity liveness query. `subject` is the node id whose ownership is in
+// question. Handled before the duplicate quarantine so a node still in
+// startup preflight can ask.
+message IdentityProbe {
+  uint64 nonce   = 1;
+  uint32 subject = 2;
+}
+
+// Answer to an IdentityProbe. `hello_epochs` only carries Hello/HelloAck
+// observations: a relayed LSA proves nothing about liveness. The LSDB and
+// floor fields let the requester distinguish "no entry" from "entry gone".
+message IdentityProbeResp {
+  uint64 nonce = 1;
+  uint32 subject = 2;
+  repeated HelloObservation hello_epochs = 3;
+  uint64 lsdb_epoch = 4;
+  uint64 lsdb_seq   = 5;
+  uint64 floor_epoch = 6;
+  uint64 floor_seq   = 7;
+}
+
+// Notice to an LSA origin that a higher (boot_epoch, seq) for that origin is
+// already known here, so its advertisements can never land. Only sent when
+// the LSA arrived directly from the origin itself.
+message OriginFenced {
+  uint32 origin      = 1;
+  uint64 fence_epoch = 2;
+  uint64 fence_seq   = 3;
 }
 
 // Direct-neighbor liveness probe. Sent over the L1 stream to a single

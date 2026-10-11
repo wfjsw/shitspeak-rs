@@ -11,6 +11,7 @@ pub mod privileges;
 pub mod s2s;
 pub mod self_actions;
 pub mod strict_delete;
+pub mod strict_identity_incident;
 pub mod strict_live_state;
 pub mod user_stats;
 pub mod voice;

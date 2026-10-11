@@ -86,6 +86,10 @@ impl MessageType {
             OverlayBody::LsdbSync(_) => MessageType::LsdbSync,
             OverlayBody::LsdbSyncResp(_) => MessageType::LsdbSyncResp,
             OverlayBody::Control(_) => MessageType::Control,
+            // Identity probes and fence notices are control-plane too.
+            OverlayBody::IdentityProbe(_)
+            | OverlayBody::IdentityProbeResp(_)
+            | OverlayBody::OriginFenced(_) => MessageType::Control,
             OverlayBody::Data(data) => {
                 if data.service_tag == DISTRIBUTION_CONTROL_SERVICE_TAG {
                     let control = shitspeak_proto::s2s_overlay_proto::DistributionControl::decode(

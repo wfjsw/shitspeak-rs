@@ -41,6 +41,7 @@ use super::lsdb::{
 use super::messaging::forward as messaging_forward;
 use super::neighbor::hello::{HelloContext, handle_hello_ack, respond_to_hello};
 use super::neighbor::monitor::NeighborMonitor;
+use super::identity_guard::{FenceTrigger, IdentityGuard};
 use super::proto::{OverlayBody, decode_message};
 use super::routing::RoutingHandle;
 
@@ -61,6 +62,8 @@ pub(crate) struct DispatcherCtx {
     pub cfg: super::config::OverlayConfig,
     pub emitter: Arc<LsaEmitter>,
     pub flood_pacer: Arc<LsaFloodPacer>,
+    /// Absent until the overlay has an identity to protect.
+    pub identity_guard: Option<Arc<IdentityGuard>>,
 }
 
 /// Spawn one dispatcher task per priority queue. They run independently
@@ -108,6 +111,26 @@ async fn handle(
     let Some(body) = decoded.body else {
         return;
     };
+    // A probe only asks what we have observed about one node id. It carries
+    // no epoch and never feeds the duplicate detector, so it is answered even
+    // from a quarantined sender: a node still in startup preflight needs the
+    // answer to decide whether a competitor is live.
+    if let OverlayBody::IdentityProbe(probe) = body {
+        if let Ok(subject) = shitspeak_core::NodeIdentifier::try_from(probe.subject) {
+            let observations = ctx.duplicate_detector.hello_observations(subject);
+            super::identity::handle_identity_probe(
+                &ctx.lsdb,
+                ctx.lsdb.floor(),
+                &observations,
+                &ctx.transport,
+                ctx.self_id,
+                from,
+                probe,
+            )
+            .await;
+        }
+        return;
+    }
     let body_kind = body_kind(&body);
     if ctx.duplicate_detector.is_quarantined(from) {
         ctx.duplicate_detector.record_drop(from, body_kind);
@@ -142,15 +165,18 @@ async fn handle(
             )
             .await
         }
-        OverlayBody::LsdbSyncResp(resp) => handle_sync_response(
-            &ctx.lsdb,
-            &ctx.monitor,
-            &ctx.transport,
-            &ctx.flood_pacer,
-            &ctx.duplicate_detector,
-            from,
-            resp,
-        ),
+        OverlayBody::LsdbSyncResp(resp) => {
+            handle_sync_response(
+                &ctx.lsdb,
+                &ctx.monitor,
+                &ctx.transport,
+                &ctx.flood_pacer,
+                &ctx.duplicate_detector,
+                from,
+                resp,
+            )
+            .await
+        }
         OverlayBody::Control(control) => {
             messaging_forward::handle_control(
                 &ctx.transport,
@@ -162,6 +188,24 @@ async fn handle(
                 control,
             )
             .await
+        }
+        OverlayBody::IdentityProbeResp(resp) => {
+            if let Some(response) = super::identity::IdentityProbeResponse::from_probe_resp(resp) {
+                if let Some(guard) = ctx.identity_guard.as_ref() {
+                    guard.deliver_probe_response(response);
+                }
+            }
+        }
+        OverlayBody::OriginFenced(fenced) => {
+            if let Some(guard) = ctx.identity_guard.as_ref() {
+                guard.report_trigger(FenceTrigger::OriginFenced {
+                    fence_epoch: fenced.fence_epoch,
+                    fence_seq: fenced.fence_seq,
+                });
+            }
+        }
+        OverlayBody::IdentityProbe(_) => {
+            // Handled before the quarantine gate above.
         }
         OverlayBody::Data(data) => {
             messaging_forward::handle_inbound_with_distribution(
@@ -203,5 +247,8 @@ fn body_kind(body: &OverlayBody) -> &'static str {
         OverlayBody::LsdbSyncResp(_) => "LsdbSyncResp",
         OverlayBody::Control(_) => "Control",
         OverlayBody::Data(_) => "OverlayData",
+        OverlayBody::IdentityProbe(_) => "IdentityProbe",
+        OverlayBody::IdentityProbeResp(_) => "IdentityProbeResp",
+        OverlayBody::OriginFenced(_) => "OriginFenced",
     }
 }

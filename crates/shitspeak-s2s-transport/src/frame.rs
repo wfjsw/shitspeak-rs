@@ -27,6 +27,7 @@ pub enum FrameType {
     Bye,
     Dictionary,
     DictionaryAck,
+    DuplicateNode,
 }
 
 impl From<FrameType> for pb::FrameType {
@@ -40,6 +41,7 @@ impl From<FrameType> for pb::FrameType {
             FrameType::Bye => pb::FrameType::FrameBye,
             FrameType::Dictionary => pb::FrameType::FrameDictionary,
             FrameType::DictionaryAck => pb::FrameType::FrameDictionaryAck,
+            FrameType::DuplicateNode => pb::FrameType::FrameDuplicateNode,
         }
     }
 }
@@ -55,6 +57,7 @@ impl From<pb::FrameType> for FrameType {
             pb::FrameType::FrameBye => FrameType::Bye,
             pb::FrameType::FrameDictionary => FrameType::Dictionary,
             pb::FrameType::FrameDictionaryAck => FrameType::DictionaryAck,
+            pb::FrameType::FrameDuplicateNode => FrameType::DuplicateNode,
         }
     }
 }
@@ -301,6 +304,7 @@ mod tests {
             FrameType::Pong,
             FrameType::KeepAlive,
             FrameType::Bye,
+            FrameType::DuplicateNode,
         ] {
             let i = pb::FrameType::from(ty) as i32;
             assert_eq!(FrameType::try_from(i).unwrap(), ty);

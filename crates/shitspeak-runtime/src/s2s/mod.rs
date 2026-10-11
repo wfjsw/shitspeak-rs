@@ -127,6 +127,9 @@ pub struct S2SManager {
     local_geo: SharedNodeGeo,
     max_users: Arc<AtomicU64>,
     state: RwLock<S2SRuntimeState>,
+    /// Set by the running incarnation when the identity guard asks for
+    /// re-incarnation; consumed by the supervisor that restarts S2S.
+    reincarnation: parking_lot::Mutex<Option<s2s_overlay::identity_guard::ReincarnationRequest>>,
 }
 
 /// Result of attempting to commit a locally-originated ban through strict
@@ -427,6 +430,19 @@ fn estimate_recipient_index_snapshot(update: &RecipientIndexUpdate) -> usize {
                 .covered_nodes()
                 .len()
                 .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
+        )
+        .saturating_add(
+            update
+                .promiscuous_nodes()
+                .iter()
+                .map(|(server_id, nodes)| {
+                    server_id.len().saturating_add(
+                        nodes
+                            .len()
+                            .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
+                    )
+                })
+                .sum::<usize>(),
         )
         .max(S2S_GATEWAY_COMMAND_OVERHEAD_BYTES)
 }
@@ -906,6 +922,7 @@ impl S2SManager {
             local_geo: SharedNodeGeo::new(config.s2s.geo.manual_geo()),
             max_users: Arc::new(AtomicU64::new(config.max_users)),
             state: RwLock::new(state),
+            reincarnation: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1637,6 +1654,13 @@ impl S2SManager {
             native_runtime,
         };
 
+        // A re-incarnation request retires this incarnation without a full
+        // server shutdown. It is a plain cancellation token rather than a
+        // derived watch channel: if the requesting task is cancelled the
+        // token is simply never cancelled, and the incarnation falls back to
+        // watching the server's own shutdown signal.
+        let reincarnate = tokio_util::sync::CancellationToken::new();
+
         let worker_threads = crate::runtime_workers::runtime_worker_allocation().s2s();
         let thread = thread::Builder::new()
             .name("s2s-runtime".to_owned())
@@ -1657,7 +1681,7 @@ impl S2SManager {
                 info!(worker_threads, "started s2s tokio runtime");
 
                 runtime.block_on(async move {
-                    self.run_runtime(server, shutdown, gateways).await;
+                    self.run_runtime(server, shutdown, gateways, reincarnate).await;
                 });
             });
 
@@ -1686,12 +1710,32 @@ impl S2SManager {
         self.state.read().inbound_chaos.clone()
     }
 
+    /// Record a re-incarnation request from the identity guard.
+    pub(crate) fn record_reincarnation(
+        &self,
+        request: s2s_overlay::identity_guard::ReincarnationRequest,
+    ) {
+        *self.reincarnation.lock() = Some(request);
+    }
+
+    /// Take the pending re-incarnation request, if any.
+    pub fn take_reincarnation_request(
+        &self,
+    ) -> Option<s2s_overlay::identity_guard::ReincarnationRequest> {
+        self.reincarnation.lock().take()
+    }
+
     async fn run_runtime(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
         mut shutdown: watch::Receiver<()>,
         gateways: S2SGateways,
+        reincarnate: tokio_util::sync::CancellationToken,
     ) {
+        // When this S2S incarnation began. A hello older than this can only
+        // belong to an earlier incarnation of this very node, never to a
+        // live competitor.
+        let incarnation_start = std::time::Instant::now();
         if !self.enabled {
             self.clear_gateway_tx();
             drop(gateways);
@@ -1736,20 +1780,32 @@ impl S2SManager {
         };
 
         let local_node = transport.local_node_id();
-        let preflight_window = self
+        // Seed dials settle first: they are what reach a process already
+        // holding this identity. Refusal notices for those sessions arrive
+        // within a round trip of the dial. S2S is refused only on evidence
+        // that a competitor is live on the overlay, not merely present.
+        let transport_settle = self
             .overlay_config
             .hello_interval()
             .saturating_mul(2)
             .min(self.overlay_config.hello_dead_interval())
-            .min(Duration::from_millis(250))
-            .max(Duration::from_millis(100));
-        let (inbound, duplicate_evidence) =
-            s2s_overlay::duplicate_startup_preflight(local_node, inbound, preflight_window).await;
-        if let Some(evidence) = duplicate_evidence {
+            .clamp(Duration::from_millis(250), Duration::from_secs(2));
+        let (inbound, evidence) = s2s_overlay::duplicate_startup_identity_preflight(
+            local_node,
+            &transport,
+            inbound,
+            incarnation_start,
+            transport_settle,
+            self.overlay_config.hello_interval(),
+            self.overlay_config.hello_dead_interval(),
+        )
+        .await;
+        if let Some(evidence) = evidence {
             error!(
                 node = local_node,
                 source = evidence.source(),
                 kind = evidence.kind(),
+                remote = ?evidence.remote(),
                 "fatal s2s startup failure: duplicate local node id observed on the network; disabling S2S for this server process"
             );
             {
@@ -1972,7 +2028,38 @@ impl S2SManager {
 
         info!(node = overlay.local_node_id(), "s2s runtime started");
 
-        let _ = shutdown.changed().await;
+        // The identity guard publishes a request when an impostor that fenced
+        // this node id has gone away. Retire this incarnation so the
+        // supervisor can bring up a new one above the impostor's epoch.
+        {
+            let manager = Arc::clone(&self);
+            let mut requests = overlay.reincarnation_requests();
+            let reincarnate = reincarnate.clone();
+            tokio::spawn(async move {
+                while requests.changed().await.is_ok() {
+                    let request = requests.borrow_and_update().clone();
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    warn!(
+                        floor_epoch = request.floor_epoch,
+                        reason = request.reason,
+                        "retiring S2S incarnation for re-incarnation above the impostor epoch"
+                    );
+                    manager.record_reincarnation(request);
+                    reincarnate.cancel();
+                    return;
+                }
+            });
+        }
+
+        // Stop on a server shutdown or a re-incarnation request. A cancelled
+        // re-incarnation task simply never cancels the token, so this degrades
+        // to plain shutdown handling.
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            _ = reincarnate.cancelled() => {}
+        }
         if let Some(task) = geo_retry_task {
             let _ = task.await;
         }
@@ -2466,10 +2553,12 @@ async fn enqueue_voice_recipient_index_snapshot(
     tx: &S2SGatewayTx,
 ) {
     let snapshot = repo.voice_recipient_index_snapshot().await;
+    let promiscuous_nodes = repo.promiscuous_voice_nodes_snapshot().await;
     let (_, versions) = repo.snapshot_with_versions().await;
     let complete_servers = channels.known_server_ids().into_iter().collect();
     let covered_nodes = versions.keys().copied().collect();
-    let update = RecipientIndexUpdate::new(snapshot, complete_servers, covered_nodes);
+    let update = RecipientIndexUpdate::new(snapshot, complete_servers, covered_nodes)
+        .with_promiscuous_nodes(promiscuous_nodes);
     if !tx.try_send_coalesced(NativeToS2SCommand::RefreshVoiceRecipientIndex(update)) {
         warn!("s2s voice recipient index gateway full; dropping snapshot");
     }

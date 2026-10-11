@@ -63,6 +63,7 @@ mod adaptive_queue;
 mod compression;
 mod config;
 mod connection;
+mod duplicate_identity;
 mod endpoint;
 mod error;
 mod frame;
@@ -94,6 +95,7 @@ pub use connection::{
     AddressBackoffSnapshot, QuicSessionProtocol, QuicSessionStatusSnapshot, TransportPayloadPlan,
     TransportPayloadVariant,
 };
+pub use duplicate_identity::{DuplicateIdentityEvidence, DuplicateIdentityEvidenceKind};
 pub use error::{ConfigError, SendError, TransportError};
 pub use frame::{
     Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes,

@@ -184,7 +184,7 @@ pub async fn push_snapshot(
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
 /// admission rule (including the floor check). Accepted LSAs are re-flooded
 /// just like flood-admitted LSAs so point-to-point repair can propagate.
-pub fn handle_response(
+pub async fn handle_response(
     lsdb: &LinkStateDb,
     monitor: &NeighborMonitor,
     transport: &ConnectionManager,
@@ -195,10 +195,22 @@ pub fn handle_response(
 ) {
     let mut accepted = 0usize;
     let mut accepted_lsas = Vec::new();
+    let self_id = lsdb.local_node_id();
     for pb_lsa in resp.delta {
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
+        if lsa.origin == self_id {
+            if let Some(guard) = lsdb.identity_guard() {
+                guard.report_trigger(
+                    crate::overlay::identity_guard::FenceTrigger::ForeignSelfLsa {
+                        foreign_epoch: lsa.boot_epoch,
+                        foreign_seq: lsa.seq,
+                    },
+                );
+            }
+            continue;
+        }
         duplicate_detector.observe_epoch(
             lsa.origin,
             lsa.boot_epoch,
@@ -209,10 +221,15 @@ pub fn handle_response(
             duplicate_detector.record_drop(lsa.origin, "lsa");
             continue;
         }
-        if matches!(lsdb.admit(lsa.clone()), AdmissionResult::Accepted) {
-            learn_from_lsa(transport, &lsa);
-            accepted_lsas.push(pb_lsa);
-            accepted += 1;
+        match lsdb.admit(lsa.clone()) {
+            AdmissionResult::Accepted => {
+                learn_from_lsa(transport, &lsa);
+                accepted_lsas.push(pb_lsa);
+                accepted += 1;
+            }
+            AdmissionResult::Stale | AdmissionResult::BelowFloor => {
+                super::advert::notice_origin_if_fenced(lsdb, transport, self_id, sender, &lsa).await;
+            }
         }
     }
     if accepted > 0 {

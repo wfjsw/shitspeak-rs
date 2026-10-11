@@ -2833,6 +2833,156 @@ async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+/// Checks that a `promiscuous` user on another node hears normal speech and
+/// whispers from a channel with no listeners on that node, while targeted
+/// delivery would otherwise skip the node entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_targeted_voice_reaches_remote_promiscuous_user() {
+    const TALK_CHANNEL: u32 = 60;
+    const WHISPER_SLOT: u32 = 3;
+
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_targeted_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    a.authenticator
+        .register_user("carol", None, Some(2), vec![]);
+    b.authenticator.register_privileged_user(
+        "eve",
+        None,
+        Some(3),
+        vec![],
+        [shitspeak_auth::Privilege::Promiscuous],
+    );
+    b.authenticator
+        .register_user("mallory", None, Some(4), vec![]);
+
+    a.server
+        .get_channels()
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(TALK_CHANNEL, "Talk".to_owned(), 0, 0, Some(0)),
+        )
+        .await
+        .expect("create talk channel");
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let carol = TestClient::connect_and_authenticate(&a, "carol", None)
+        .await
+        .expect("carol");
+    let eve = TestClient::connect_and_authenticate(&b, "eve", None)
+        .await
+        .expect("eve");
+    let mallory = TestClient::connect_and_authenticate(&b, "mallory", None)
+        .await
+        .expect("mallory");
+    alice.move_to_channel(TALK_CHANNEL).await;
+
+    let replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let b_knows_alice =
+                handle
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|client| client.get_current_channel_id() == TALK_CHANNEL);
+            let a_knows_promiscuous_eve = handle
+                .block_on(a.server.get_clients().promiscuous_voice_nodes_snapshot())
+                .get(crate::types::DEFAULT_SERVER_ID)
+                .is_some_and(|nodes| nodes.contains(&2));
+            b_knows_alice && a_knows_promiscuous_eve
+        })
+    })
+    .await;
+    assert!(
+        replicated,
+        "B should learn alice's channel and A should learn eve is promiscuous"
+    );
+    assert!(
+        a.server
+            .get_clients()
+            .voice_recipient_index_snapshot()
+            .await
+            .get(
+                &shitspeak_s2s::application::voice::targeted::RecipientIndexKey::new(
+                    crate::types::DEFAULT_SERVER_ID,
+                    TALK_CHANNEL,
+                ),
+            )
+            .is_some_and(|nodes| !nodes.contains(&2)),
+        "no client on node 2 has a channel interest in the talk channel"
+    );
+    // Let the coalesced recipient-index refresh reach the voice service.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    eve.drain_now().await;
+    mallory.drain_now().await;
+
+    alice
+        .send_voice_tcp(0, 1, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    let audio = eve
+        .recv_voice_tcp(CLIENT_DEADLINE)
+        .await
+        .expect("eve should hear normal speech from another node's channel");
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+    assert!(
+        mallory
+            .recv_voice_tcp(Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a regular user on the promiscuous node must not hear it"
+    );
+
+    alice
+        .set_voice_target(VoiceTarget {
+            id: Some(WHISPER_SLOT),
+            targets: vec![VoiceTargetEntry {
+                session: vec![carol.session_id],
+                ..Default::default()
+            }],
+        })
+        .await;
+    let installed =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(a.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|client| client.voice_target(WHISPER_SLOT).is_some())
+            })
+        })
+        .await;
+    assert!(installed, "alice's whisper target should be installed");
+    alice
+        .send_voice_tcp(WHISPER_SLOT, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    let whisper = carol
+        .recv_voice_tcp(CLIENT_DEADLINE)
+        .await
+        .expect("carol is the whisper target");
+    assert_eq!(whisper.sender_session, Some(alice.server_session));
+    let audio = eve
+        .recv_voice_tcp(CLIENT_DEADLINE)
+        .await
+        .expect("eve should hear a whisper between users on another node");
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+    assert!(
+        mallory
+            .recv_voice_tcp(Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a regular user on the promiscuous node must not hear the whisper"
+    );
+}
+
 /// Checks the Mumble "shout to linked channels" voice-target shape across
 /// nodes. The sender targets its current channel with `links=true`, while the
 /// recipient is connected to a linked channel on another server.
@@ -5529,4 +5679,92 @@ async fn s2s_ban_replication_propagates() {
     .await;
 
     assert!(replicated, "Server B should contain the replicated ban");
+}
+
+/// Automatic recovery, end to end: an impostor that fenced this node's id with
+/// a higher boot epoch is gone, and the S2S stack must re-incarnate itself
+/// above that epoch — without restarting the server and without dropping the
+/// clients that are connected to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_reincarnates_above_an_impostor_epoch_keeping_local_clients() {
+    let _guard = s2s_network_test_guard().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let (a, b) = spawn_s2s_pair_on_ports(pki, a_s2s_port, b_s2s_port).await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    wait_for_server_to_track_client(&a, alice.server_session).await;
+
+    let epoch_before = a
+        .server
+        .s2s_manager()
+        .overlay()
+        .expect("node 1 overlay")
+        .local_boot_epoch();
+
+    // An impostor fenced us with a far higher epoch and then disappeared. The
+    // guard probes the peer, sees no live foreign epoch, and asks for recovery.
+    let impostor_epoch = epoch_before.saturating_add(500_000);
+    a.server
+        .s2s_manager()
+        .overlay()
+        .expect("node 1 overlay")
+        .identity_guard()
+        .report_trigger(shitspeak_s2s::overlay::identity_guard::FenceTrigger::OriginFenced {
+            fence_epoch: impostor_epoch,
+            fence_seq: 1,
+        });
+
+    let reincarnated = wait_until(Duration::from_secs(90), || {
+        a.server
+            .s2s_manager()
+            .overlay()
+            .is_some_and(|overlay| overlay.local_boot_epoch() > epoch_before)
+    })
+    .await;
+    assert!(
+        reincarnated,
+        "S2S never re-incarnated above the impostor's epoch"
+    );
+
+    let epoch_after = a
+        .server
+        .s2s_manager()
+        .overlay()
+        .expect("re-incarnated overlay")
+        .local_boot_epoch();
+    assert!(
+        epoch_after > impostor_epoch,
+        "the new epoch must outrank the impostor: {epoch_after} vs {impostor_epoch}"
+    );
+
+    // The peer follows the new incarnation instead of staying fenced.
+    let peer_followed = wait_until(Duration::from_secs(90), || {
+        b.server
+            .s2s_manager()
+            .overlay()
+            .and_then(|overlay| overlay.member(1))
+            .is_some_and(|member| member.boot_epoch() == epoch_after)
+    })
+    .await;
+    assert!(
+        peer_followed,
+        "the peer never adopted the re-incarnated epoch: {:?}",
+        b.server.s2s_manager().overlay().map(|overlay| overlay.members())
+    );
+
+    // The local client was connected across the S2S restart.
+    assert!(
+        client_sees_user_state(&alice, alice.server_session, "alice").await,
+        "a local client must survive S2S re-incarnation"
+    );
+
+    drop(alice);
+    a.shutdown_gracefully().await;
+    b.shutdown_gracefully().await;
 }
