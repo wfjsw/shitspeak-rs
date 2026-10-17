@@ -5768,3 +5768,83 @@ async fn s2s_reincarnates_above_an_impostor_epoch_keeping_local_clients() {
     a.shutdown_gracefully().await;
     b.shutdown_gracefully().await;
 }
+
+async fn spawn_s2s_max_users_node(
+    pki: Arc<Pki>,
+    node_id: u16,
+    max_users: u64,
+    listen_port: u16,
+    seed_port: u16,
+) -> TestServer {
+    spawn_s2s_test_server(
+        TestServerOpts {
+            max_users,
+            ..TestServerOpts::default()
+        },
+        pki,
+        TestS2sServerOpts {
+            node_id,
+            cert_index: usize::from(node_id - 1),
+            tcp_listen: loopback(listen_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(seed_port),
+            )],
+        },
+    )
+    .await
+}
+
+/// Waits for a `ServerConfig` whose `max_users` equals `expected`.
+async fn client_sees_server_config_max_users(client: &TestClient, expected: u32) -> bool {
+    let deadline = Instant::now() + S2S_DEADLINE * 2;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Some(Message::ServerConfig(config)) = client
+            .recv_until(|m| matches!(m, Message::ServerConfig(_)), remaining)
+            .await
+        else {
+            return false;
+        };
+        if config.max_users == Some(expected) {
+            return true;
+        }
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_server_config_max_users_tracks_cluster_membership() {
+    let _guard = s2s_network_test_guard().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let a = spawn_s2s_max_users_node(Arc::clone(&pki), 1, 100, a_s2s_port, b_s2s_port).await;
+    let b = spawn_s2s_max_users_node(Arc::clone(&pki), 2, 50, b_s2s_port, a_s2s_port).await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator.register_user("alice", None, Some(1), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    assert!(
+        client_sees_server_config_max_users(&alice, 150).await,
+        "ServerConfig.max_users should be the cluster-wide total"
+    );
+
+    b.shutdown_gracefully().await;
+    assert!(
+        client_sees_server_config_max_users(&alice, 100).await,
+        "ServerConfig.max_users should be re-broadcast after a node leaves"
+    );
+
+    let b_restarted_s2s_port = pick_free_port().await;
+    let b = spawn_s2s_max_users_node(pki, 2, 50, b_restarted_s2s_port, a_s2s_port).await;
+    wait_for_s2s_pair(&a, &b).await;
+    assert!(
+        client_sees_server_config_max_users(&alice, 150).await,
+        "ServerConfig.max_users should be re-broadcast after a node joins"
+    );
+
+    a.shutdown_gracefully().await;
+    b.shutdown_gracefully().await;
+}

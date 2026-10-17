@@ -85,6 +85,7 @@ max_users = 250
 welcome_text = "Welcome"
 max_bandwidth = 72000
 allow_html = true
+recording_allowed = true
 max_text_message_length = 5000
 max_image_message_length = 131072
 
@@ -188,9 +189,12 @@ max_image_message_length = 131072
 ```toml
 welcome_text = "Welcome to ShitSpeak"
 allow_html = true
+recording_allowed = true
 root_channel_name = "Root"
 default_channel = 0
 ```
+
+`recording_allowed` (default `true`) is advertised to clients in `ServerConfig`; Mumble clients disable their recording feature when it is `false`. Changes are pushed to connected clients on config reload.
 
 `default_channel` is the channel id used for new sessions when no persisted last/listening channel restoration applies.
 
@@ -273,7 +277,7 @@ udp_channel_size = 2048
 
 `udp_voice_enabled = false` keeps the UDP loop available for ping behavior but drops UDP voice packets.
 
-`udp_ping_user_count_scope` controls whether UDP ping responses report clusterwide users/max users or only users/max users on this node.
+`udp_ping_user_count_scope` controls whether UDP ping responses report clusterwide users/max users or only users/max users on this node. It does not affect `ServerConfig`: the `max_users` advertised to connected clients is always the clusterwide sum of `max_users` over alive, reachable nodes (this node's value when S2S is disabled), and is re-sent to connected clients whenever a node joins or leaves or a node's `max_users` changes.
 
 ## Voice
 
@@ -1471,6 +1475,7 @@ Reloaded successfully at runtime:
 - `root_channel_name`
 - `max_bandwidth`
 - `max_users`
+- `recording_allowed`
 - `authenticator`
 - `cert_path` and `key_path` for new client TLS handshakes
 - `s2s.overlay.route_transit_messages`

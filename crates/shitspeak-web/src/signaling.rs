@@ -1688,8 +1688,8 @@ async fn send_initial_server_state(
             allow_html: Some(server.get_allow_html()),
             message_length: Some(server.get_max_text_message_length()),
             image_message_length: Some(server.get_max_image_message_length()),
-            max_users: Some(server.get_max_users() as u32),
-            recording_allowed: None,
+            max_users: Some(server.server_config_max_users()),
+            recording_allowed: Some(server.get_recording_allowed()),
         }
         .into(),
     )
@@ -3462,6 +3462,7 @@ mod tests {
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
+            recording_allowed: true,
             max_text_message_length: 5_000,
             max_image_message_length: 131_072,
             root_channel_name: "Root".into(),

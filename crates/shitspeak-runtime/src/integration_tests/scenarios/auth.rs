@@ -2136,3 +2136,32 @@ async fn force_language_overrides_pre_authentication_rejections() {
         Ok(_) => panic!("auth should have failed"),
     }
 }
+
+#[tokio::test]
+async fn auth_server_config_advertises_max_users_and_recording_allowed() {
+    let server = spawn_test_server(TestServerOpts {
+        max_users: 37,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let config = alice
+        .recv_until(
+            |message| matches!(message, Message::ServerConfig(_)),
+            Duration::from_secs(2),
+        )
+        .await;
+    match config {
+        Some(Message::ServerConfig(config)) => {
+            assert_eq!(config.max_users, Some(37));
+            assert_eq!(config.recording_allowed, Some(true));
+        }
+        other => panic!("expected ServerConfig in auth burst, got {other:?}"),
+    }
+}

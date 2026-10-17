@@ -25,6 +25,7 @@ max_users = 100
 welcome_text = "Welcome to ShitSpeak test server!"
 max_bandwidth = 72000
 allow_html = true
+recording_allowed = true
 max_text_message_length = 5000
 max_image_message_length = 131072
 root_channel_name = "Root"

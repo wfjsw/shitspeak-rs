@@ -1075,6 +1075,9 @@ impl S2SManager {
         }
     }
 
+    /// Sum of `max_users` over this node and every alive, reachable peer.
+    /// A peer that stopped without a delivered tombstone keeps its LSA until
+    /// it ages out; requiring a route drops it as soon as routing does.
     pub fn cluster_max_users(&self) -> Option<u64> {
         self.overlay().map(|overlay| {
             let local_node_id = overlay.local_node_id();
@@ -1085,6 +1088,9 @@ impl S2SManager {
                 .filter(|member| {
                     member.node_id() != local_node_id
                         && member.status() == s2s_overlay::MemberStatus::Alive
+                        && overlay
+                            .route_to(member.node_id(), s2s_transport::ServiceLevel::Reliable)
+                            .is_some()
                 })
                 .map(|member| member.max_users())
                 .fold(local_max_users, u64::saturating_add)

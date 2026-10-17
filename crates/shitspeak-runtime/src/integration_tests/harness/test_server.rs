@@ -532,6 +532,7 @@ async fn spawn_test_server_with_pki(
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,
+        recording_allowed: true,
         max_text_message_length: 5_000,
         max_image_message_length: 131_072,
         root_channel_name: "Root".into(),

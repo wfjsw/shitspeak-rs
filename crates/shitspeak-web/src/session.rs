@@ -829,7 +829,7 @@ pub fn web_server_config(
         message_length: config.message_length,
         image_message_length: config.image_message_length,
         max_users: config.max_users,
-        recording_allowed: None,
+        recording_allowed: config.recording_allowed,
     }
 }
 
@@ -954,8 +954,8 @@ pub async fn initial_server_events_with_channel_snapshot(
             allow_html: Some(server.get_allow_html()),
             message_length: Some(server.get_max_text_message_length()),
             image_message_length: Some(server.get_max_image_message_length()),
-            max_users: Some(server.get_max_users() as u32),
-            recording_allowed: None,
+            max_users: Some(server.server_config_max_users()),
+            recording_allowed: Some(server.get_recording_allowed()),
         }
         .into(),
     );

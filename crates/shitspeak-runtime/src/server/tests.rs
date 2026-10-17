@@ -141,6 +141,7 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,
+        recording_allowed: true,
         max_text_message_length: 5_000,
         max_image_message_length: 131_072,
         root_channel_name: "Root".to_owned(),
@@ -1318,6 +1319,56 @@ async fn config_reload_pushes_max_users_to_authenticated_clients() {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+}
+
+#[tokio::test]
+async fn config_reload_pushes_recording_allowed_to_authenticated_clients() {
+    let config = test_config(Vec::new());
+    let server = Server::new(config.clone(), TestAuthenticator)
+        .await
+        .expect("server");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let client = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:52000".parse().unwrap(),
+            "127.0.0.1:52001".parse().unwrap(),
+            tx,
+        )
+        .await;
+    client.set_authenticated(true);
+    let temp = tempfile::tempdir().expect("reload config tempdir");
+    let config_path = temp.path().join("config.toml");
+    for recording_allowed in [false, true] {
+        write_max_bandwidth_reload_config(&config, &config_path, config.max_bandwidth);
+        let mut contents = std::fs::read_to_string(&config_path).expect("read reload config");
+        contents.push_str(&format!("recording_allowed = {recording_allowed}
+"));
+        std::fs::write(&config_path, contents).expect("write reload config");
+        server
+            .reload_config_from(&config_path)
+            .await
+            .expect("reload config");
+        assert_eq!(server.get_recording_allowed(), recording_allowed);
+        let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("recording_allowed update timeout")
+            .expect("recording_allowed update");
+        match message {
+            Message::ServerConfig(update) => {
+                assert_eq!(update.recording_allowed, Some(recording_allowed));
+                assert_eq!(update.max_users, None);
+                assert_eq!(update.max_bandwidth, None);
+            }
+            other => panic!("expected ServerConfig recording_allowed update, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 }
 

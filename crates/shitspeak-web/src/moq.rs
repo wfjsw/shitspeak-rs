@@ -2695,6 +2695,7 @@ mod tests {
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
+            recording_allowed: true,
             max_text_message_length: 5_000,
             max_image_message_length: 131_072,
             root_channel_name: "Root".to_string(),

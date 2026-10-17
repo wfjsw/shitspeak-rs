@@ -1404,6 +1404,9 @@ pub struct Config {
     pub max_bandwidth: u32,
     #[serde(default = "default_true")]
     pub allow_html: bool,
+    /// Whether clients may record audio. Advertised in `ServerConfig`.
+    #[serde(default = "default_true")]
+    pub recording_allowed: bool,
     #[serde(default = "default_max_text_message_length")]
     pub max_text_message_length: u32,
     #[serde(default = "default_max_image_message_length")]
@@ -2134,6 +2137,18 @@ mod tests {
 
     fn language(tag: &str) -> Language {
         Language::parse(tag).expect("valid language tag")
+    }
+
+    #[test]
+    fn recording_allowed_defaults_to_true() {
+        let config = parse_config(MINIMAL_CONFIG).expect("minimal config parses");
+        assert!(config.recording_allowed);
+
+        let config = parse_config(&format!("{MINIMAL_CONFIG}
+recording_allowed = false
+"))
+            .expect("recording_allowed config parses");
+        assert!(!config.recording_allowed);
     }
 
     #[test]

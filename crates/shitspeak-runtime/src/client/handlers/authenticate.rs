@@ -640,8 +640,8 @@ pub async fn handle_authenticate(
                 allow_html: Some(auth_config.allow_html),
                 message_length: Some(auth_config.max_text_message_length),
                 image_message_length: Some(auth_config.max_image_message_length),
-                max_users: Some(auth_config.max_users as u32),
-                recording_allowed: None,
+                max_users: Some(server.server_config_max_users()),
+                recording_allowed: Some(auth_config.recording_allowed),
             }
             .into(),
         ));

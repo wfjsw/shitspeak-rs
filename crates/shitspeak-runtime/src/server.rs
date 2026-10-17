@@ -331,6 +331,11 @@ pub struct Server {
     shutdown_tx: tokio::sync::watch::Sender<()>,
     visibility_reload_tx: broadcast::Sender<()>,
     visibility_generation: AtomicU64,
+    /// Cluster-wide `max_users` last advertised to clients in `ServerConfig`.
+    advertised_cluster_max_users: AtomicU64,
+    /// Serializes recompute-and-broadcast of `ServerConfig` deltas so clients
+    /// never observe an older `max_users` after a newer one.
+    server_config_push_lock: tokio::sync::Mutex<()>,
     client_projection_pool: std::sync::OnceLock<client_projection_pool::ClientProjectionPool>,
 
     /// Server-generated text, including live translations from Weblate.
@@ -482,6 +487,7 @@ impl Server {
         let auth_ip_burst = config.auth_rate_limit_ip_burst;
         let auth_account_rate_per_second = config.auth_rate_limit_per_account_per_second;
         let auth_account_burst = config.auth_rate_limit_account_burst;
+        let advertised_cluster_max_users = config.max_users;
         let config = ArcSwap::from_pointee(config);
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
         let (visibility_reload_tx, _visibility_reload_rx) = broadcast::channel(64);
@@ -566,6 +572,8 @@ impl Server {
             shutdown_tx,
             visibility_reload_tx,
             visibility_generation: AtomicU64::new(0),
+            advertised_cluster_max_users: AtomicU64::new(advertised_cluster_max_users),
+            server_config_push_lock: tokio::sync::Mutex::new(()),
             client_projection_pool: std::sync::OnceLock::new(),
             localizer: Arc::new(crate::localization::Localizer::bundled()),
             channel_name_translations: Arc::new(
@@ -858,6 +866,8 @@ impl Server {
             pending_delete_timeout_ms,
             internal_rx.clone(),
         );
+        let cluster_max_users_watcher =
+            Self::spawn_cluster_max_users_watcher(Arc::downgrade(self), internal_rx.clone());
         let mut extension_tasks = JoinSet::<()>::new();
         self.extensions
             .spawn_tasks(Arc::clone(self), internal_rx.clone(), &mut extension_tasks)?;
@@ -975,6 +985,7 @@ impl Server {
         let _ = udp_process.await;
         let _ = idle_reaper.await;
         let _ = pending_delete_watchdog.await;
+        let _ = cluster_max_users_watcher.await;
         while extension_tasks.join_next().await.is_some() {}
         let _ = remote_channel_cache_observer.await;
         let _ = s2s_task.await;
@@ -1835,6 +1846,95 @@ impl Server {
         Ok(())
     }
 
+    /// Re-broadcast `ServerConfig.max_users` whenever the cluster-wide total
+    /// changes. Membership events give prompt reaction to joins and leaves;
+    /// the periodic poll also catches peers whose advertised `max_users`
+    /// changes through LSA refresh without a membership transition.
+    fn spawn_cluster_max_users_watcher(
+        server: std::sync::Weak<Box<Self>>,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(CLUSTER_MAX_USERS_POLL_INTERVAL);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut membership: Option<
+                broadcast::Receiver<shitspeak_s2s::overlay::MembershipEvent>,
+            > = None;
+            loop {
+                {
+                    let Some(server) = server.upgrade() else {
+                        break;
+                    };
+                    if membership.is_none() {
+                        membership = server
+                            .s2s_manager
+                            .overlay()
+                            .map(|overlay| overlay.subscribe_membership());
+                    }
+                    server.push_server_config_delta(None, None).await;
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    _ = poll.tick() => {}
+                    event = async {
+                        match membership.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if matches!(event, Err(broadcast::error::RecvError::Closed)) {
+                            membership = None;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Cluster-wide `max_users`: the sum over this node and every alive,
+    /// reachable peer, or this node's configured value when S2S is not
+    /// running.
+    pub fn cluster_max_users(&self) -> u64 {
+        self.s2s_manager
+            .cluster_max_users()
+            .filter(|max_users| *max_users > 0)
+            .unwrap_or_else(|| self.read_config().max_users)
+    }
+
+    /// `ServerConfig.max_users` for a newly authenticated client: always the
+    /// cluster-wide value, independent of `udp_ping_user_count_scope`.
+    pub fn server_config_max_users(&self) -> u32 {
+        clamp_max_users(self.advertised_cluster_max_users.load(Ordering::Relaxed))
+    }
+
+    /// Push a `ServerConfig` delta to authenticated clients. `max_users` is
+    /// included only when the cluster-wide value differs from the one last
+    /// advertised; the other fields are forwarded as given.
+    async fn push_server_config_delta(
+        &self,
+        max_bandwidth: Option<u32>,
+        recording_allowed: Option<bool>,
+    ) {
+        let _push = self.server_config_push_lock.lock().await;
+        let current = self.cluster_max_users();
+        let previous = self
+            .advertised_cluster_max_users
+            .swap(current, Ordering::Relaxed);
+        let max_users = (previous != current).then(|| {
+            tracing::info!(
+                previous,
+                current,
+                "cluster max_users changed; re-broadcasting ServerConfig"
+            );
+            clamp_max_users(current)
+        });
+        if max_bandwidth.is_none() && max_users.is_none() && recording_allowed.is_none() {
+            return;
+        }
+        self.push_server_config_update(max_bandwidth, max_users, recording_allowed)
+            .await;
+    }
+
     /// Spawn a periodic task that disconnects authenticated local clients who
     /// haven't sent a ping within `timeout_secs`.
     fn spawn_idle_reaper(
@@ -2423,6 +2523,7 @@ impl Server {
                     visibility_reload,
                     max_bandwidth_changed,
                     max_users_changed,
+                    recording_allowed_changed,
                 ) = {
                     let mut invalidate_acl_cache = false;
                     let mut root_channel_config_update = None;
@@ -2430,6 +2531,15 @@ impl Server {
                     let current = self.config.load_full();
                     let max_bandwidth_changed = current.max_bandwidth != new_config.max_bandwidth;
                     let max_users_changed = current.max_users != new_config.max_users;
+                    let recording_allowed_changed =
+                        current.recording_allowed != new_config.recording_allowed;
+                    if recording_allowed_changed {
+                        tracing::info!(
+                            "config reload: recording_allowed {} -> {}",
+                            current.recording_allowed,
+                            new_config.recording_allowed
+                        );
+                    }
                     // Log notable changes
                     if current.welcome_text != new_config.welcome_text {
                         tracing::info!("config reload: welcome_text changed");
@@ -2670,6 +2780,7 @@ impl Server {
                         visibility_reload,
                         max_bandwidth_changed,
                         max_users_changed,
+                        recording_allowed_changed,
                     )
                 };
                 if let Some(root_channel_config) = root_channel_config_update {
@@ -2684,8 +2795,15 @@ impl Server {
                     self.visibility_generation.fetch_add(1, Ordering::SeqCst);
                     let _ = self.visibility_reload_tx.send(());
                 }
-                if max_bandwidth_changed || max_users_changed {
-                    self.push_server_config_update(max_bandwidth_changed, max_users_changed)
+                if max_bandwidth_changed || max_users_changed || recording_allowed_changed {
+                    let (max_bandwidth, recording_allowed) = {
+                        let config = self.read_config();
+                        (
+                            max_bandwidth_changed.then_some(config.max_bandwidth),
+                            recording_allowed_changed.then_some(config.recording_allowed),
+                        )
+                    };
+                    self.push_server_config_delta(max_bandwidth, recording_allowed)
                         .await;
                 }
                 self.auth_finalization_queue
@@ -3100,34 +3218,28 @@ impl Server {
 
     async fn push_server_config_update(
         &self,
-        max_bandwidth_changed: bool,
-        max_users_changed: bool,
+        max_bandwidth: Option<u32>,
+        max_users: Option<u32>,
+        recording_allowed: Option<bool>,
     ) {
-        let (max_bandwidth, max_users) = {
-            let config = self.read_config();
-            (
-                max_bandwidth_changed.then_some(config.max_bandwidth),
-                max_users_changed.then_some(config.max_users as u32),
-            )
-        };
         for client in self.clients.get_local_clients().await {
             if !client.is_authenticated() {
                 continue;
             }
             let max_bandwidth = max_bandwidth.filter(|_| client.max_bandwidth_override().is_none());
-            if max_bandwidth.is_none() && max_users.is_none() {
+            if max_bandwidth.is_none() && max_users.is_none() && recording_allowed.is_none() {
                 continue;
             }
             if let Some(max_bandwidth) = max_bandwidth {
                 client.set_voice_bandwidth_limit(max_bandwidth);
             }
-            self.send_server_config_update(&client, max_bandwidth, max_users)
+            self.send_server_config_update(&client, max_bandwidth, max_users, recording_allowed)
                 .await;
         }
     }
 
     async fn send_max_bandwidth_update(&self, client: &Client, max_bandwidth: u32) {
-        self.send_server_config_update(client, Some(max_bandwidth), None)
+        self.send_server_config_update(client, Some(max_bandwidth), None, None)
             .await;
     }
 
@@ -3136,6 +3248,7 @@ impl Server {
         client: &Client,
         max_bandwidth: Option<u32>,
         max_users: Option<u32>,
+        recording_allowed: Option<bool>,
     ) {
         let message: shitspeak_messages::messages::Message =
             shitspeak_messages::messages::encoder::ServerConfig {
@@ -3145,7 +3258,7 @@ impl Server {
                 message_length: None,
                 image_message_length: None,
                 max_users,
-                recording_allowed: None,
+                recording_allowed,
             }
             .into();
         if let Err(error) = client.enqueue_proto_message(&message).await {
@@ -3164,6 +3277,10 @@ impl Server {
 
     pub fn get_allow_html(&self) -> bool {
         self.read_config().allow_html
+    }
+
+    pub fn get_recording_allowed(&self) -> bool {
+        self.read_config().recording_allowed
     }
 
     pub fn get_max_text_message_length(&self) -> u32 {
@@ -3205,12 +3322,7 @@ impl Server {
                 let users = server
                     .clients
                     .authenticated_client_count_in_server(status_server_id);
-                let max_users = server
-                    .s2s_manager
-                    .cluster_max_users()
-                    .filter(|max_users| *max_users > 0)
-                    .unwrap_or(local_max_users);
-                (users as u64, max_users)
+                (users as u64, server.cluster_max_users())
             }
             UdpPingUserCountScope::Local => {
                 let users = server
@@ -3291,6 +3403,12 @@ impl Server {
             }
         }
     }
+}
+
+const CLUSTER_MAX_USERS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn clamp_max_users(max_users: u64) -> u32 {
+    u32::try_from(max_users).unwrap_or(u32::MAX)
 }
 
 fn effective_udp_processing_channel_size(configured_floor: usize, max_users: u64) -> usize {
