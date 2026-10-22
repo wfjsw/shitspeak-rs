@@ -673,7 +673,7 @@ fn evaluate_permission_impl<A: ChannelReference>(
         );
     }
 
-    if !ancestor_path_allows_traverse(ancestors, user_id, client) {
+    if !client.path_gate_exempt() && !ancestor_path_allows_traverse(ancestors, user_id, client) {
         return BitFlags::empty();
     }
 
@@ -693,28 +693,30 @@ fn evaluate_compiled_acl(
     client: &ClientMembershipQuery,
     explicit_enter_deny_overrides_write: bool,
 ) -> BitFlags<ACLPermissions> {
-    for stage in &compiled.path {
-        let mut traverse = true;
-        let mut write = false;
-        for entry in &stage.entries {
-            if !entry.matches(user_id, client) {
-                continue;
+    if !client.path_gate_exempt() {
+        for stage in &compiled.path {
+            let mut traverse = true;
+            let mut write = false;
+            for entry in &stage.entries {
+                if !entry.matches(user_id, client) {
+                    continue;
+                }
+                if entry.allow.contains(ACLPermissions::Traverse) {
+                    traverse = true;
+                }
+                if entry.deny.contains(ACLPermissions::Traverse) {
+                    traverse = false;
+                }
+                if entry.allow.contains(ACLPermissions::Write) {
+                    write = true;
+                }
+                if entry.deny.contains(ACLPermissions::Write) {
+                    write = false;
+                }
             }
-            if entry.allow.contains(ACLPermissions::Traverse) {
-                traverse = true;
+            if !traverse && !write {
+                return BitFlags::empty();
             }
-            if entry.deny.contains(ACLPermissions::Traverse) {
-                traverse = false;
-            }
-            if entry.allow.contains(ACLPermissions::Write) {
-                write = true;
-            }
-            if entry.deny.contains(ACLPermissions::Write) {
-                write = false;
-            }
-        }
-        if !traverse && !write {
-            return BitFlags::empty();
         }
     }
 
@@ -739,6 +741,7 @@ fn evaluate_compiled_acl(
         permissions,
         enter_explicitly_denied,
         explicit_enter_deny_overrides_write,
+        client.path_gate_exempt(),
     )
 }
 
@@ -788,6 +791,7 @@ fn evaluate_channel_acl<A: ChannelReference>(
         permissions,
         enter_explicitly_denied,
         explicit_enter_deny_overrides_write,
+        client.path_gate_exempt(),
     )
 }
 
@@ -796,8 +800,13 @@ fn finalize_permissions(
     mut permissions: BitFlags<ACLPermissions>,
     enter_explicitly_denied: bool,
     explicit_enter_deny_overrides_write: bool,
+    path_gate_exempt: bool,
 ) -> BitFlags<ACLPermissions> {
-    if !permissions.contains(ACLPermissions::Traverse)
+    // Same rule as the ancestor Traverse barrier, expressed on the granted
+    // bits: "cannot reach ⇒ cannot act". Suspended for a channel the client
+    // has reached — see `ClientMembershipQuery::with_path_gate_exempt`.
+    if !path_gate_exempt
+        && !permissions.contains(ACLPermissions::Traverse)
         && !permissions.contains(ACLPermissions::Write)
     {
         return BitFlags::empty();

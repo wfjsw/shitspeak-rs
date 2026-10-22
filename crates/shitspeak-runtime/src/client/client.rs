@@ -74,6 +74,11 @@ struct ClientCachedAclPermissions {
     client_acl_home_generation: u64,
     depends_on_home_channel: bool,
     explicit_enter_deny_overrides_write: bool,
+    /// Whether the ancestor Traverse barrier was suspended for this entry.
+    /// Part of the cache key: the exemption flips when the client moves or
+    /// when the home channel's link group changes, and neither is covered by
+    /// the generation counters alone.
+    path_gate_exempt: bool,
     permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
 }
 
@@ -140,12 +145,14 @@ impl ClientCachedAclPermissions {
         client_acl_subject_generation: u64,
         client_acl_home_generation: u64,
         explicit_enter_deny_overrides_write: bool,
+        path_gate_exempt: bool,
     ) -> Option<(enumflags2::BitFlags<shitspeak_state::ACLPermissions>, bool)> {
         (self.channel_acl_generation == channel_acl_generation
             && self.client_acl_subject_generation == client_acl_subject_generation
             && (!self.depends_on_home_channel
                 || self.client_acl_home_generation == client_acl_home_generation)
-            && self.explicit_enter_deny_overrides_write == explicit_enter_deny_overrides_write)
+            && self.explicit_enter_deny_overrides_write == explicit_enter_deny_overrides_write
+            && self.path_gate_exempt == path_gate_exempt)
             .then_some((self.permissions, self.depends_on_home_channel))
     }
 }
@@ -1210,9 +1217,16 @@ impl Client {
         }
     }
 
-    pub(crate) fn acl_cache_metadata(&self) -> (bool, (u64, u64)) {
+    /// Superuser bit, ACL generations, and the client's current channel —
+    /// everything the ACL cache and the path-gate exemption need, under one
+    /// global-state read lock.
+    pub(crate) fn acl_cache_metadata(&self) -> (bool, (u64, u64), u32) {
         let state = self.global_state.read();
-        (state.is_superuser(), state.get_acl_cache_generations())
+        (
+            state.is_superuser(),
+            state.get_acl_cache_generations(),
+            state.get_current_channel_id(),
+        )
     }
 
     pub fn has_group(&self, group: &str) -> bool {
@@ -1411,6 +1425,7 @@ impl Client {
         client_acl_subject_generation: u64,
         client_acl_home_generation: u64,
         explicit_enter_deny_overrides_write: bool,
+        path_gate_exempt: bool,
     ) -> Option<(enumflags2::BitFlags<shitspeak_state::ACLPermissions>, bool)> {
         self.acl_permission_cache
             .read_sync(&channel_id, |_, entry| {
@@ -1419,6 +1434,7 @@ impl Client {
                     client_acl_subject_generation,
                     client_acl_home_generation,
                     explicit_enter_deny_overrides_write,
+                    path_gate_exempt,
                 )
             })
             .flatten()
@@ -1433,6 +1449,7 @@ impl Client {
         client_acl_home_generation: u64,
         depends_on_home_channel: bool,
         explicit_enter_deny_overrides_write: bool,
+        path_gate_exempt: bool,
         permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
     ) {
         let entry = ClientCachedAclPermissions {
@@ -1441,6 +1458,7 @@ impl Client {
             client_acl_home_generation,
             depends_on_home_channel,
             explicit_enter_deny_overrides_write,
+            path_gate_exempt,
             permissions,
         };
         self.acl_permission_cache.upsert_sync(channel_id, entry);
@@ -3176,24 +3194,30 @@ mod tests {
         // 256 entries. The per-client map retains the connection's full
         // working set without competing with other clients.
         for channel_id in 0..1024 {
-            client.cache_acl_permissions(channel_id, 3, 5, 7, false, false, permissions);
+            client.cache_acl_permissions(channel_id, 3, 5, 7, false, false, false, permissions);
         }
         for channel_id in 0..1024 {
             assert_eq!(
-                client.get_cached_acl_permissions(channel_id, 3, 5, 99, false),
+                client.get_cached_acl_permissions(channel_id, 3, 5, 99, false, false),
                 Some((permissions, false))
             );
         }
 
         assert!(
             client
-                .get_cached_acl_permissions(0, 3, 6, 7, false)
+                .get_cached_acl_permissions(0, 3, 6, 7, false, false)
                 .is_none()
+        );
+        assert!(
+            client
+                .get_cached_acl_permissions(0, 3, 5, 99, false, true)
+                .is_none(),
+            "the path-gate exemption is part of the cache key"
         );
         client.set_server_id("other-server".to_owned());
         assert!(
             client
-                .get_cached_acl_permissions(0, 3, 5, 7, false)
+                .get_cached_acl_permissions(0, 3, 5, 7, false, false)
                 .is_none()
         );
     }

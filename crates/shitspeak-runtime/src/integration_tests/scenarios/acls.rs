@@ -2187,6 +2187,7 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
                 subject_generation,
                 old_home_generation,
                 false,
+                false,
             )
             .is_some()
     );
@@ -2197,6 +2198,7 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
                 home_channel_generation,
                 subject_generation,
                 old_home_generation,
+                false,
                 false,
             )
             .is_some()
@@ -2219,6 +2221,7 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
                 same_subject_generation,
                 new_home_generation,
                 false,
+                false,
             )
             .is_some()
     );
@@ -2229,6 +2232,7 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
                 home_channel_generation,
                 same_subject_generation,
                 new_home_generation,
+                false,
                 false,
             )
             .is_none()
@@ -2246,6 +2250,7 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
                 static_channel_generation,
                 new_subject_generation,
                 current_home_generation,
+                false,
                 false,
             )
             .is_none()

@@ -5848,3 +5848,228 @@ async fn s2s_server_config_max_users_tracks_cluster_membership() {
     a.shutdown_gracefully().await;
     b.shutdown_gracefully().await;
 }
+
+/// Two ordinary users sitting in the same channel on DIFFERENT nodes: a
+/// channel text addressed to that channel must reach the remote member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_same_channel_text_reaches_remote_co_present_member() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let channels = a.server.get_channels();
+    channels
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(273, "Room".to_owned(), 0, 0, Some(0)),
+        )
+        .await
+        .expect("create room channel");
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.move_to_channel(273).await;
+    bob.move_to_channel(273).await;
+
+    let placements_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let b_knows_alice = handle
+                .block_on(b.server.get_clients().get_client_in_server(
+                    crate::types::DEFAULT_SERVER_ID,
+                    alice.server_session,
+                ))
+                .is_some_and(|c| c.get_current_channel_id() == 273);
+            let a_knows_bob = handle
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
+                .is_some_and(|c| c.get_current_channel_id() == 273);
+            b_knows_alice && a_knows_bob
+        })
+    })
+    .await;
+    assert!(
+        placements_replicated,
+        "both nodes should learn both placements in channel 273"
+    );
+
+    bob.drain_now().await;
+    alice
+        .send(
+            TextMessage {
+                actor: None,
+                session: Vec::new(),
+                channel_id: vec![273],
+                tree_id: Vec::new(),
+                message: "cross-node room text".to_owned(),
+            }
+            .into(),
+        )
+        .await;
+
+    let received = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::TextMessage(t)
+                    if t.message == "cross-node room text" && t.channel_id.contains(&273))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        received.is_some(),
+        "co-present member on a remote node must receive the channel text"
+    );
+
+    a.shutdown_gracefully().await;
+    b.shutdown_gracefully().await;
+}
+
+/// Cross-node linked-channel normal speech under a shared `@~sub,-1` Speak ACL.
+/// The speaker is an ordinary user on node A; the listener is a member of the
+/// linked channel on node B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_linked_normal_voice_under_shared_sub_acl() {
+    use shitspeak_messages::messages::encoder::ChanAcl;
+    use shitspeak_state::ACLPermissions;
+
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_targeted_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator
+        .register_superuser("admin", None, Some(1), vec!["admin".into()]);
+    a.authenticator.register_user("alice", None, Some(2), vec![]);
+    b.authenticator.register_user("bob", None, Some(3), vec![]);
+
+    let channels = a.server.get_channels();
+    channels
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(300, "Parent".to_owned(), 0, 0, Some(0)),
+        )
+        .await
+        .expect("create parent");
+    channels
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(273, "A".to_owned(), 0, 0, Some(300)),
+        )
+        .await
+        .expect("create 273");
+    channels
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(275, "B".to_owned(), 0, 0, Some(300)),
+        )
+        .await
+        .expect("create 275");
+    channels
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 273, 275)
+        .await
+        .expect("link 273<->275");
+
+    let links_replicated = wait_until(S2S_DEADLINE, || {
+        b.server
+            .get_channels()
+            .effective_link_group_in_server(crate::types::DEFAULT_SERVER_ID, 273)
+            .is_some_and(|group| group.contains(&275))
+    })
+    .await;
+    assert!(links_replicated, "server B should learn the channel link");
+
+    let admin = TestClient::connect_and_authenticate(&a, "admin", None)
+        .await
+        .expect("admin");
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    let shared_acl = vec![
+        ChanAcl {
+            apply_here: true,
+            apply_subs: true,
+            inherited: false,
+            user_id: None,
+            group: Some("all".into()),
+            grant: 0,
+            deny: ACLPermissions::Speak as u32,
+        },
+        ChanAcl {
+            apply_here: true,
+            apply_subs: true,
+            inherited: false,
+            user_id: None,
+            group: Some("~sub,-1".into()),
+            grant: ACLPermissions::Speak as u32,
+            deny: 0,
+        },
+    ];
+    admin.set_acls(300, shared_acl.clone(), true).await;
+    admin.set_acls(273, shared_acl.clone(), true).await;
+    admin.set_acls(275, shared_acl, true).await;
+
+    alice.move_to_channel(273).await;
+    bob.move_to_channel(275).await;
+
+    let ready = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let b_knows_alice = handle
+                .block_on(b.server.get_clients().get_client_in_server(
+                    crate::types::DEFAULT_SERVER_ID,
+                    alice.server_session,
+                ))
+                .is_some_and(|c| c.get_current_channel_id() == 273);
+            let a_knows_bob = handle
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
+                .is_some_and(|c| c.get_current_channel_id() == 275);
+            b_knows_alice && a_knows_bob
+        })
+    })
+    .await;
+    assert!(ready, "both nodes should learn both placements");
+
+    let replicated_alice = b
+        .server
+        .get_clients()
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
+        .await
+        .expect("server B should retain replicated Alice");
+    let linked_perms =
+        crate::client::acl::compute_permissions_for_client(&b.server, &replicated_alice, 275).await;
+    assert!(
+        linked_perms.contains(ACLPermissions::Speak),
+        "replicated Alice must hold Speak on linked channel 275 under the shared @~sub,-1 ACL \
+         (got {linked_perms:?}); cross-node linked voice is gated on this"
+    );
+
+    bob.drain_now().await;
+    alice
+        .send_voice_tcp(0, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let audio = bob.recv_voice_tcp(CLIENT_DEADLINE).await;
+    assert!(
+        audio.is_some(),
+        "member of the linked channel on a remote node must hear normal speech"
+    );
+
+    a.shutdown_gracefully().await;
+    b.shutdown_gracefully().await;
+}

@@ -183,6 +183,9 @@ pub struct ClientMembershipQuery<'a> {
     asn: Option<u32>,
     country_code: Option<&'a str>,
     home_channel: ChannelHierarchy<'a>,
+    /// Whether the ancestor Traverse barrier is suspended for the channel
+    /// being evaluated. See [`ClientMembershipQuery::with_path_gate_exempt`].
+    path_gate_exempt: bool,
 }
 
 impl<'a> ClientMembershipQuery<'a> {
@@ -204,6 +207,7 @@ impl<'a> ClientMembershipQuery<'a> {
             asn: None,
             country_code: None,
             home_channel: ChannelHierarchy::new(0, &[]),
+            path_gate_exempt: false,
         }
     }
 
@@ -216,6 +220,24 @@ impl<'a> ClientMembershipQuery<'a> {
     pub fn with_home_channel(mut self, home_channel: ChannelHierarchy<'a>) -> Self {
         self.home_channel = home_channel;
         self
+    }
+
+    /// Suspend the ancestor Traverse barrier for the channel being evaluated.
+    ///
+    /// The barrier exists so that "cannot reach this channel" implies "cannot
+    /// act on it". Reaching a channel is proof to the contrary, so a client
+    /// evaluating their own home channel — or a channel in its effective link
+    /// group, the set their speech already crosses into — keeps whatever the
+    /// destination channel itself grants. The barrier is untouched for every
+    /// other channel, and Traverse itself is still only granted by ACL, so
+    /// this does not widen what the client can see.
+    pub fn with_path_gate_exempt(mut self, path_gate_exempt: bool) -> Self {
+        self.path_gate_exempt = path_gate_exempt;
+        self
+    }
+
+    pub fn path_gate_exempt(&self) -> bool {
+        self.path_gate_exempt
     }
 
     pub fn authenticated(&self) -> bool {

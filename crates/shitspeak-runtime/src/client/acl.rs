@@ -454,7 +454,7 @@ async fn compute_permissions_for_client_inner(
     identity_override: Option<(Option<u32>, HashSet<String>, bool)>,
 ) -> enumflags2::BitFlags<ACLPermissions> {
     let session = u32::from(client.get_session_id());
-    let (cached_is_superuser, (cached_subject_generation, cached_home_generation)) =
+    let (cached_is_superuser, (cached_subject_generation, cached_home_generation), cached_home) =
         client.acl_cache_metadata();
     let cached_is_superuser = identity_override
         .as_ref()
@@ -463,6 +463,17 @@ async fn compute_permissions_for_client_inner(
     let explicit_enter_deny_overrides_write = server.get_explicit_enter_deny_overrides_write();
 
     let channels = server.get_channels();
+    let server_id = client.server_id();
+    // Occupancy is proof of reach: the ancestor Traverse barrier ("cannot
+    // reach ⇒ cannot act") is suspended for the client's home channel and the
+    // channels linked to it — the set their speech already crosses into. Every
+    // other channel keeps the barrier. Traverse itself is still only granted
+    // by ACL, so this does not widen what the client can see.
+    let home_channel_id = home_channel_override.unwrap_or(cached_home);
+    let path_gate_exempt = channel_id == home_channel_id
+        || channels
+            .effective_link_group_in_server(&server_id, home_channel_id)
+            .is_some_and(|group| group.contains(&channel_id));
     let use_acl_cache =
         !cached_is_superuser && home_channel_override.is_none() && identity_override.is_none();
 
@@ -476,6 +487,7 @@ async fn compute_permissions_for_client_inner(
                 cached_subject_generation,
                 cached_home_generation,
                 explicit_enter_deny_overrides_write,
+                path_gate_exempt,
             )?;
             let (current_subject_generation, current_home_generation) =
                 client.get_acl_cache_generations();
@@ -498,7 +510,6 @@ async fn compute_permissions_for_client_inner(
         return permissions;
     }
 
-    let server_id = client.server_id();
     let (mut channel_acl_generation, mut channel) = channels
         .get_channel_for_acl_in_server(&server_id, channel_id)
         .await;
@@ -538,8 +549,6 @@ async fn compute_permissions_for_client_inner(
     };
     let group_refs = BorrowedStrs::<8>::from_strings(groups);
     let token_refs = BorrowedStrs::<8>::from_strings(client_state.tokens());
-    let home_channel_id =
-        home_channel_override.unwrap_or_else(|| client_state.current_channel_id());
     let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
         channel.effective_acl_ancestor_ids().map_or_else(
             || ancestors.iter().map(|ancestor| ancestor.id).collect(),
@@ -569,7 +578,8 @@ async fn compute_permissions_for_client_inner(
         Some(client.get_real_ip_address()),
     )
     .with_ip_metadata(ip_geo_asn, ip_geo_country)
-    .with_home_channel(home_channel);
+    .with_home_channel(home_channel)
+    .with_path_gate_exempt(path_gate_exempt);
 
     tracing::trace!(
         session,
@@ -583,6 +593,7 @@ async fn compute_permissions_for_client_inner(
         ancestors = ancestors.len(),
         is_superuser,
         explicit_enter_deny_overrides_write,
+        path_gate_exempt,
         "Computing ACL permissions"
     );
 
@@ -626,6 +637,7 @@ async fn compute_permissions_for_client_inner(
                     client_acl_home_generation,
                     depends_on_home_channel,
                     explicit_enter_deny_overrides_write,
+                    path_gate_exempt,
                     permissions,
                 );
             }
