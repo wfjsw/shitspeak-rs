@@ -1037,9 +1037,14 @@ async fn resolve_voice_intent_with_resolved_channels(
                 );
             }
 
+            // Listeners must receive exactly what a member of the channel
+            // would: the whole fan-out set, not just the speaker's own channel.
+            // Members of a linked channel hear the speaker, so listeners of
+            // that linked channel have to as well. Matches the Target path,
+            // which looks up listeners for every resolved channel id.
             let listeners = server
                 .get_clients()
-                .get_local_listeners_for_channel_in_server(server_id, source_channel)
+                .get_local_listeners_for_channels_in_server(server_id, normal_channel_ids)
                 .await;
             for client in listeners {
                 if let Some(sender) = sender {

@@ -197,9 +197,12 @@ pub async fn handle_text_message(
             {
                 continue;
             }
-            if !client.is_authenticated()
-                || !target_channel_ids.contains(&client.get_current_channel_id())
-            {
+            // The lookup above already narrowed this to members of the target
+            // channels and listeners subscribed to them. Both are entitled to
+            // the message — a listener behaves as if they were in the channel —
+            // so do not re-filter on the recipient's current channel here; that
+            // would silently drop every listener.
+            if !client.is_authenticated() {
                 continue;
             }
             let Some(attribution) = text_sender_attribution(server, client, sender).await else {
@@ -228,9 +231,9 @@ pub async fn handle_text_message(
             {
                 continue;
             }
-            if !client.is_authenticated()
-                || !tree_deliverable_channels.contains(&client.get_current_channel_id())
-            {
+            // Same as the channel loop: the lookup already covers members of
+            // the deliverable subtree and listeners subscribed to any of them.
+            if !client.is_authenticated() {
                 continue;
             }
             let Some(attribution) = text_sender_attribution(server, client, sender).await else {

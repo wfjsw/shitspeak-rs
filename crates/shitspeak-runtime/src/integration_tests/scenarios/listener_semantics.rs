@@ -95,6 +95,23 @@ async fn expect_channel_text(
         .unwrap_or_else(|| panic!("{reason}"))
 }
 
+/// Like [`expect_channel_text`], but for a message addressed to a channel
+/// *subtree*. Those carry the root in `tree_id` and leave `channel_id` empty.
+async fn expect_tree_text(recipient: &TestClient, expected: &str, root: u32, reason: &str) -> Message {
+    recipient
+        .recv_until(
+            |m| {
+                matches!(m, Message::TextMessage(t)
+                    if t.message == expected
+                        && t.tree_id.contains(&root)
+                        && t.channel_id.is_empty())
+            },
+            VOICE_DEADLINE,
+        )
+        .await
+        .unwrap_or_else(|| panic!("{reason}"))
+}
+
 /// A listener of a LINKED channel must hear normal speech coming from the
 /// other member of the link group, exactly as a member of that channel does.
 #[tokio::test]
@@ -490,10 +507,10 @@ async fn listener_of_channel_receives_tree_text() {
         )
         .await;
 
-    expect_channel_text(
+    expect_tree_text(
         &bob,
         "hello subtree",
-        273,
+        300,
         "listener of a subtree channel must receive the tree text",
     )
     .await;
