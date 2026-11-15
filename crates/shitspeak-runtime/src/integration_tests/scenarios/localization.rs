@@ -10,7 +10,9 @@ use shitspeak_runtime_config::{
 };
 
 use crate::integration_tests::harness::test_client::ConnectError;
-use crate::integration_tests::harness::{TestClient, TestServer, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    TestClient, TestServer, TestServerOpts, spawn_test_server,
+};
 use crate::localization::Language;
 use crate::localization::weblate_mock::MockWeblate;
 use crate::types::DEFAULT_SERVER_ID;
@@ -50,9 +52,13 @@ async fn server_with_channel_names(mock: &MockWeblate) -> TestServer {
     server
         .authenticator
         .register_superuser("admin", None, Some(1), vec!["admin".into()]);
-    server
-        .authenticator
-        .register_user_with_language("carmen", None, Some(2), vec![], language("es-MX"));
+    server.authenticator.register_user_with_language(
+        "carmen",
+        None,
+        Some(2),
+        vec![],
+        language("es-MX"),
+    );
     server
         .authenticator
         .register_user_with_language("hans", None, Some(3), vec![], language("de"));
@@ -126,7 +132,10 @@ async fn recv_channel_names(client: &TestClient, expected: &[(u32, &str)]) {
     })
     .await
     .ok();
-    assert!(missing.is_empty(), "channel names not received: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "channel names not received: {missing:?}"
+    );
 }
 
 fn initial_name(client: &TestClient, channel_id: u32) -> Option<&str> {
@@ -204,7 +213,9 @@ async fn new_channel_names_are_pushed_to_weblate() {
     )
     .await;
     assert!(
-        mock.added_keys().iter().all(|key| key != "Lobby" && key != "Root"),
+        mock.added_keys()
+            .iter()
+            .all(|key| key != "Lobby" && key != "Root"),
         "names Weblate already knows are not pushed again: {:?}",
         mock.added_keys()
     );
@@ -282,16 +293,26 @@ async fn language_change_resends_visible_channel_names() {
         .await
         .expect("server-side client");
 
-    assert!(server.server.apply_client_language(&client, Some(language("de"))));
+    assert!(
+        server
+            .server
+            .apply_client_language(&client, Some(language("de")))
+    );
     server.server.refresh_client_language(&client).await;
     recv_channel_names(&carmen, &[(0, "Root"), (lobby, "Lobby")]).await;
 
-    assert!(server.server.apply_client_language(&client, Some(language("es"))));
+    assert!(
+        server
+            .server
+            .apply_client_language(&client, Some(language("es")))
+    );
     server.server.refresh_client_language(&client).await;
     recv_channel_names(&carmen, &[(0, "Raíz"), (lobby, "Vestíbulo")]).await;
 
     assert!(
-        !server.server.apply_client_language(&client, Some(language("es"))),
+        !server
+            .server
+            .apply_client_language(&client, Some(language("es"))),
         "reapplying the same language is not a change"
     );
 }
@@ -304,9 +325,13 @@ async fn no_channel_name_translation_supplies_the_raw_names() {
     const QUIET: Duration = Duration::from_millis(300);
     let mock = channel_name_component().await;
     let server = server_with_channel_names(&mock).await;
-    server
-        .authenticator
-        .register_user_with_language("carlos", None, Some(4), vec![], language("es-MX"));
+    server.authenticator.register_user_with_language(
+        "carlos",
+        None,
+        Some(4),
+        vec![],
+        language("es-MX"),
+    );
     server.authenticator.set_privileges(
         "carlos",
         [shitspeak_auth::Privilege::NoChannelNameTranslation],
@@ -367,9 +392,13 @@ async fn channel_name_cache_serves_translations_while_weblate_is_down() {
         ..TestServerOpts::default()
     })
     .await;
-    server
-        .authenticator
-        .register_user_with_language("carmen", None, Some(2), vec![], language("es"));
+    server.authenticator.register_user_with_language(
+        "carmen",
+        None,
+        Some(2),
+        vec![],
+        language("es"),
+    );
     let carmen = TestClient::connect_and_authenticate(&server, "carmen", None)
         .await
         .expect("carmen");
@@ -381,8 +410,16 @@ async fn channel_name_cache_serves_translations_while_weblate_is_down() {
 #[tokio::test]
 async fn live_server_text_translations_apply_without_restart() {
     let mock = MockWeblate::start().await;
-    mock.set_translation("en", true, &[("reject.WrongUserPw", "Incorrect username or password")]);
-    mock.set_translation("es", false, &[("reject.WrongUserPw", "Credenciales no válidas")]);
+    mock.set_translation(
+        "en",
+        true,
+        &[("reject.WrongUserPw", "Incorrect username or password")],
+    );
+    mock.set_translation(
+        "es",
+        false,
+        &[("reject.WrongUserPw", "Credenciales no válidas")],
+    );
     let server = spawn_test_server(TestServerOpts {
         default_language: language("es"),
         translation_sync: Some(
@@ -464,7 +501,9 @@ async fn channel_editor_reply_shows_the_raw_name() {
                 Some(Message::ChannelState(state)) if state.channel_id == Some(music) => {
                     sequence.push(format!("name:{}", state.name.unwrap_or_default()));
                 }
-                Some(Message::ACL(acl)) if acl.channel_id == music => sequence.push("acl".to_owned()),
+                Some(Message::ACL(acl)) if acl.channel_id == music => {
+                    sequence.push("acl".to_owned())
+                }
                 Some(_) => {}
                 None => break,
             }
@@ -501,12 +540,17 @@ async fn saving_the_editor_with_an_unchanged_name_is_a_no_op() {
             |message| {
                 matches!(
                     message,
-                    Message::PermissionDenied(_) | Message::TextMessage(_) | Message::ChannelState(_)
+                    Message::PermissionDenied(_)
+                        | Message::TextMessage(_)
+                        | Message::ChannelState(_)
                 )
             },
             Duration::from_millis(750),
         )
         .await;
     assert!(unexpected.is_none(), "unexpected response: {unexpected:?}");
-    assert_eq!(channels.current_version_in_server(DEFAULT_SERVER_ID), version);
+    assert_eq!(
+        channels.current_version_in_server(DEFAULT_SERVER_ID),
+        version
+    );
 }

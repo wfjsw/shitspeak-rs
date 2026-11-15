@@ -152,16 +152,7 @@ impl TestAuthenticator {
         user_id: Option<u32>,
         groups: Vec<String>,
     ) {
-        self.register_user_with_options(
-            name,
-            password,
-            user_id,
-            groups,
-            true,
-            None,
-            None,
-            None,
-        );
+        self.register_user_with_options(name, password, user_id, groups, true, None, None, None);
     }
 
     pub fn register_invisible_user(

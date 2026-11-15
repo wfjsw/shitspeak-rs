@@ -1687,7 +1687,8 @@ impl S2SManager {
                 info!(worker_threads, "started s2s tokio runtime");
 
                 runtime.block_on(async move {
-                    self.run_runtime(server, shutdown, gateways, reincarnate).await;
+                    self.run_runtime(server, shutdown, gateways, reincarnate)
+                        .await;
                 });
             });
 
@@ -3353,8 +3354,7 @@ async fn apply_user_state_patch(
     };
     let mut cache_listening_channel_ids = None;
     let hidden_before = target.is_hidden_from_regular_users();
-    let moderator_reveals_hidden_superuser = hidden_before
-        && patch.suppress == Some(false);
+    let moderator_reveals_hidden_superuser = hidden_before && patch.suppress == Some(false);
     let post_move_destination_perms = if let Some(channel_id) = patch.channel_id {
         Some(
             crate::client::acl::compute_permissions_for_client_as_if_in_channel(

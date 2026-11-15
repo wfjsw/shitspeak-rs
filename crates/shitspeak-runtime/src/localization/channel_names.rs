@@ -71,7 +71,6 @@ impl ChannelNameDiff {
     pub(crate) fn is_empty(&self) -> bool {
         self.names.is_empty() && !self.language_set_changed
     }
-
 }
 
 fn diff(old: &ChannelNameCatalog, new: &ChannelNameCatalog) -> ChannelNameDiff {
@@ -224,7 +223,10 @@ fn channel_name_maps(cache: &TranslationCache) -> HashMap<Language, ChannelNameM
             continue;
         }
         let Some(tag) = Language::parse(code) else {
-            tracing::warn!(code, "ignoring Weblate channel-name language with an invalid code");
+            tracing::warn!(
+                code,
+                "ignoring Weblate channel-name language with an invalid code"
+            );
             continue;
         };
         let map: ChannelNameMap = language
@@ -448,10 +450,23 @@ mod tests {
     #[test]
     fn translations_negotiate_regional_client_languages() {
         let translations = ChannelNameTranslations::new();
-        translations.replace(names(&[("zh-Hans", &[("Lobby", "大厅")]), ("es", &[("Lobby", "Vestíbulo")])]));
+        translations.replace(names(&[
+            ("zh-Hans", &[("Lobby", "大厅")]),
+            ("es", &[("Lobby", "Vestíbulo")]),
+        ]));
 
-        assert_eq!(translations.translate(&language("zh-CN"), "Lobby").as_deref(), Some("大厅"));
-        assert_eq!(translations.translate(&language("es-MX"), "Lobby").as_deref(), Some("Vestíbulo"));
+        assert_eq!(
+            translations
+                .translate(&language("zh-CN"), "Lobby")
+                .as_deref(),
+            Some("大厅")
+        );
+        assert_eq!(
+            translations
+                .translate(&language("es-MX"), "Lobby")
+                .as_deref(),
+            Some("Vestíbulo")
+        );
         assert_eq!(translations.translate(&language("de"), "Lobby"), None);
         assert_eq!(translations.translate(&language("es"), "Music"), None);
     }
@@ -459,17 +474,22 @@ mod tests {
     #[test]
     fn diff_reports_changed_names_and_languages() {
         let translations = ChannelNameTranslations::new();
-        let first = translations.replace(names(&[("es", &[("Lobby", "Vestíbulo"), ("Music", "Música")])]));
+        let first = translations.replace(names(&[(
+            "es",
+            &[("Lobby", "Vestíbulo"), ("Music", "Música")],
+        )]));
         assert!(first.language_set_changed);
 
-        let second = translations.replace(names(&[("es", &[("Lobby", "Sala"), ("Music", "Música")])]));
+        let second =
+            translations.replace(names(&[("es", &[("Lobby", "Sala"), ("Music", "Música")])]));
         assert!(!second.language_set_changed);
         assert_eq!(second.names, HashSet::from(["Lobby".to_owned()]));
         assert_eq!(second.languages, HashSet::from([language("es")]));
         assert!(translations.affects(&second, &language("es-MX")));
         assert!(!translations.affects(&second, &language("de")));
 
-        let unchanged = translations.replace(names(&[("es", &[("Lobby", "Sala"), ("Music", "Música")])]));
+        let unchanged =
+            translations.replace(names(&[("es", &[("Lobby", "Sala"), ("Music", "Música")])]));
         assert!(unchanged.is_empty());
     }
 

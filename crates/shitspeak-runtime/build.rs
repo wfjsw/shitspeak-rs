@@ -680,8 +680,10 @@ fn generate_localization_catalog() -> Result<(), Box<dyn Error>> {
             serde_json::to_string(&path.display().to_string())?,
         ));
     }
-    generated.push_str("];
-");
+    generated.push_str(
+        "];
+",
+    );
 
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| {
         io::Error::new(

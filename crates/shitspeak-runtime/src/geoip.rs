@@ -52,6 +52,53 @@ impl IpGeoMetadata {
     }
 }
 
+/// City-level location of a client address, with the network it sits on.
+///
+/// `location` carries the subdivision, city and coordinates `NodeGeo` already
+/// holds. `asn` and `country` are kept separate: both come from the metadata
+/// database and survive a city record that carries no coordinates, which is
+/// what country-only GeoLite builds return.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClientGeo {
+    asn: Option<u32>,
+    country: Option<String>,
+    location: Option<NodeGeo>,
+}
+
+impl ClientGeo {
+    pub fn new(
+        asn: Option<u32>,
+        country: Option<String>,
+        location: Option<NodeGeo>,
+    ) -> Option<Self> {
+        (asn.is_some() || country.is_some() || location.is_some()).then_some(Self {
+            asn,
+            country,
+            location,
+        })
+    }
+
+    pub fn asn(&self) -> Option<u32> {
+        self.asn
+    }
+
+    pub fn country(&self) -> Option<&str> {
+        self.country.as_deref()
+    }
+
+    pub fn city(&self) -> Option<&str> {
+        self.location.as_ref().and_then(NodeGeo::city)
+    }
+
+    pub fn latitude(&self) -> Option<f64> {
+        self.location.as_ref().map(NodeGeo::latitude)
+    }
+
+    pub fn longitude(&self) -> Option<f64> {
+        self.location.as_ref().map(NodeGeo::longitude)
+    }
+}
+
 /// How often the reload thread checks the database files for a change. A
 /// rewrite is adopted once its size and modification time have held steady
 /// for one interval, so an update takes effect within about two intervals.
@@ -185,6 +232,26 @@ impl GeoIpResolver {
         let path = city.path.as_deref()?;
         let reader = city.reader()?;
         lookup_city(&reader, path, &ips)
+    }
+
+    /// City-level client location plus ASN.
+    ///
+    /// The city read is deliberately not cached: one MaxMind read costs
+    /// microseconds, and a cache would pin the first answer while the client
+    /// moves or the database is swapped. ASN and country reuse the metadata
+    /// cache that also backs the moderation paths.
+    pub async fn lookup_client_geo(&self, ip: IpAddr) -> Option<ClientGeo> {
+        if !self.inner.config.enabled() || !is_public_geoip_candidate(&ip) {
+            return None;
+        }
+        let metadata = self.lookup_ip_metadata(ip).await;
+        // Reuses the node-geo path so the city read stays in one place.
+        let location = self.lookup_node_geo(&[ip]).await;
+        let (asn, country) = match metadata {
+            Some(metadata) => (metadata.asn(), metadata.country_code().map(str::to_owned)),
+            None => (None, None),
+        };
+        ClientGeo::new(asn, country, location)
     }
 
     /// Check the database files now, as the reload thread does each poll.
@@ -594,6 +661,47 @@ mod tests {
             .expect("lookup must not depend on the files after loading");
         assert_eq!(metadata.asn(), Some(15169));
         assert_eq!(metadata.country_code(), Some("US"));
+    }
+
+    /// The client lookup joins both database halves: the ASN comes from the
+    /// ASN database, the location from the city database. A country-only city
+    /// record still yields the ASN and country, with no coordinates.
+    #[tokio::test]
+    async fn client_geo_lookup_joins_asn_and_city_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        write_databases(dir.path(), 15169, "US");
+        let resolver = GeoIpResolver::load(config_for(dir.path(), 16)).await;
+
+        let geo = resolver
+            .lookup_client_geo(public_ip())
+            .await
+            .expect("client geo present");
+        assert_eq!(geo.asn(), Some(15169));
+        assert_eq!(geo.country(), Some("US"));
+        assert_eq!(geo.city(), None);
+        assert_eq!(geo.latitude(), None);
+    }
+
+    /// A client lookup must answer nothing for private addresses instead of
+    /// inventing a country, and must not touch a disabled resolver.
+    #[tokio::test]
+    async fn client_geo_lookup_skips_private_addresses_and_disabled_resolvers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_databases(dir.path(), 15169, "US");
+        let resolver = GeoIpResolver::load(config_for(dir.path(), 16)).await;
+
+        assert!(
+            resolver
+                .lookup_client_geo("10.1.2.3".parse().unwrap())
+                .await
+                .is_none()
+        );
+        assert!(
+            GeoIpResolver::disabled()
+                .lookup_client_geo(public_ip())
+                .await
+                .is_none()
+        );
     }
 
     async fn asn_now(resolver: &GeoIpResolver) -> Option<u32> {

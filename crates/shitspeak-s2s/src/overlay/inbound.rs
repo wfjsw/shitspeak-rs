@@ -35,13 +35,13 @@ use shitspeak_s2s_transport::{AdaptiveInboundReceiver, Inbound};
 
 use super::distribution::DistributionPlane;
 use super::duplicate::DuplicateDetector;
+use super::identity_guard::{FenceTrigger, IdentityGuard};
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, handle_flood, handle_sync_request, handle_sync_response,
 };
 use super::messaging::forward as messaging_forward;
 use super::neighbor::hello::{HelloContext, handle_hello_ack, respond_to_hello};
 use super::neighbor::monitor::NeighborMonitor;
-use super::identity_guard::{FenceTrigger, IdentityGuard};
 use super::proto::{OverlayBody, decode_message};
 use super::routing::RoutingHandle;
 

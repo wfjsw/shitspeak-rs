@@ -1915,7 +1915,9 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Batch(self.localize_outbound_owned(messages)))
+                    .send(ClientOutboundMessage::Batch(
+                        self.localize_outbound_owned(messages),
+                    ))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
@@ -2686,10 +2688,9 @@ impl Client {
         if !messages.iter().any(carries_channel_name) {
             return Cow::Borrowed(messages);
         }
-        match self
-            .channel_name_map()
-            .and_then(|names| crate::localization::channel_names::localize_channel_names(&names, messages))
-        {
+        match self.channel_name_map().and_then(|names| {
+            crate::localization::channel_names::localize_channel_names(&names, messages)
+        }) {
             Some(localized) => Cow::Owned(localized),
             None => Cow::Borrowed(messages),
         }
@@ -3413,7 +3414,10 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(client.cached_protected_certificate_hash_hex(8, &carol_salt), None);
+        assert_eq!(
+            client.cached_protected_certificate_hash_hex(8, &carol_salt),
+            None
+        );
 
         let cache = client.certificate_hash_projection_cache.lock();
         assert_eq!(cache.visibility_generation, Some(8));
@@ -3494,9 +3498,12 @@ mod tests {
         tx.try_send(ping(1))
             .expect("first queue slot should be free");
 
-        let full =
-            try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(2), ping(3)]), std::convert::identity)
-                .expect_err("the complete batch does not fit");
+        let full = try_send_owned_gateway_batch(
+            &tx,
+            OwnedMessageBatch::new(vec![ping(2), ping(3)]),
+            std::convert::identity,
+        )
+        .expect_err("the complete batch does not fit");
         assert!(matches!(full, mpsc::error::TrySendError::Full(_)));
         assert_eq!(outbound_batch_len(full.into_inner()), 2);
 
@@ -3509,8 +3516,12 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
-        try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(4), ping(5)]), std::convert::identity)
-            .expect("the complete batch should fit once capacity is available");
+        try_send_owned_gateway_batch(
+            &tx,
+            OwnedMessageBatch::new(vec![ping(4), ping(5)]),
+            std::convert::identity,
+        )
+        .expect("the complete batch should fit once capacity is available");
         assert!(matches!(
             rx.try_recv(),
             Ok(Message::Ping(ping)) if ping.timestamp == Some(4)
@@ -3520,7 +3531,11 @@ mod tests {
             Ok(Message::Ping(ping)) if ping.timestamp == Some(5)
         ));
 
-        let oversized = try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(6), ping(7), ping(8)]), std::convert::identity)
+        let oversized = try_send_owned_gateway_batch(
+            &tx,
+            OwnedMessageBatch::new(vec![ping(6), ping(7), ping(8)]),
+            std::convert::identity,
+        )
         .expect_err("a batch larger than maximum capacity must not panic");
         assert!(matches!(oversized, mpsc::error::TrySendError::Full(_)));
         assert_eq!(outbound_batch_len(oversized.into_inner()), 3);

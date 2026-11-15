@@ -1,8 +1,7 @@
 use shitspeak_messages::messages::encoder::UserState;
 
 const CERTIFICATE_HASH_REMAP_CONTEXT: &[u8] = b"shitspeak-rs/privacy/certificate-hash/v2";
-const CERTIFICATE_HASH_AES_KEY_CONTEXT: &[u8] =
-    b"shitspeak-rs/privacy/certificate-hash/aes-key/v1";
+const CERTIFICATE_HASH_AES_KEY_CONTEXT: &[u8] = b"shitspeak-rs/privacy/certificate-hash/aes-key/v1";
 const CERTIFICATE_HASH_AES_ROUND_CONTEXT: &[u8; 5] = b"schp1";
 const CERTIFICATE_HASH_BYTES: usize = 20;
 const CERTIFICATE_HASH_FEISTEL_HALF_BYTES: usize = CERTIFICATE_HASH_BYTES / 2;
@@ -299,11 +298,19 @@ mod tests {
     }
 
     fn alice_view_of_user_two() -> CertificateHashSalt {
-        salt(identity(None, Some(2)), &[0xaa; 20], identity(None, Some(1)))
+        salt(
+            identity(None, Some(2)),
+            &[0xaa; 20],
+            identity(None, Some(1)),
+        )
     }
 
     fn carol_view_of_user_two() -> CertificateHashSalt {
-        salt(identity(None, Some(2)), &[0xcc; 20], identity(None, Some(3)))
+        salt(
+            identity(None, Some(2)),
+            &[0xcc; 20],
+            identity(None, Some(3)),
+        )
     }
 
     #[test]
@@ -464,7 +471,11 @@ mod tests {
     fn salt_encoding_is_unambiguous() {
         let cases = [
             salt(identity(Some("ab"), None), &[1, 2], identity(None, Some(3))),
-            salt(identity(Some("a"), None), &[1], identity(Some("b"), Some(3))),
+            salt(
+                identity(Some("a"), None),
+                &[1],
+                identity(Some("b"), Some(3)),
+            ),
             salt(
                 identity(None, Some(0x0000_0102)),
                 &[3],

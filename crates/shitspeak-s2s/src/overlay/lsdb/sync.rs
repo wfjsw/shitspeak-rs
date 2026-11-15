@@ -228,7 +228,8 @@ pub async fn handle_response(
                 accepted += 1;
             }
             AdmissionResult::Stale | AdmissionResult::BelowFloor => {
-                super::advert::notice_origin_if_fenced(lsdb, transport, self_id, sender, &lsa).await;
+                super::advert::notice_origin_if_fenced(lsdb, transport, self_id, sender, &lsa)
+                    .await;
             }
         }
     }

@@ -1049,16 +1049,11 @@ impl LinkStateDb {
     }
 
     /// Install the identity guard so the LSA paths can report conflicts.
-    pub fn set_identity_guard(
-        &self,
-        guard: Arc<super::super::identity_guard::IdentityGuard>,
-    ) {
+    pub fn set_identity_guard(&self, guard: Arc<super::super::identity_guard::IdentityGuard>) {
         *self.identity_guard.write() = Some(guard);
     }
 
-    pub fn identity_guard(
-        &self,
-    ) -> Option<Arc<super::super::identity_guard::IdentityGuard>> {
+    pub fn identity_guard(&self) -> Option<Arc<super::super::identity_guard::IdentityGuard>> {
         self.identity_guard.read().clone()
     }
 

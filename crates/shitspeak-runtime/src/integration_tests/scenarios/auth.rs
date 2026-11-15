@@ -830,7 +830,9 @@ async fn certificate_hash_privacy_uses_fqdn_identity() {
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
-    server.authenticator.set_fqdn("alice", Some("alice.example"));
+    server
+        .authenticator
+        .set_fqdn("alice", Some("alice.example"));
     server.authenticator.set_fqdn("bob", Some("bob.example"));
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
@@ -936,10 +938,7 @@ async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
     let carol_view = view_of_user(&carol, bob.session_id).await;
 
     assert_eq!(user_state_hash(&alice_view), Some(expected.as_str()));
-    assert_ne!(
-        user_state_hash(&alice_view),
-        Some(bob_self_hash.as_str())
-    );
+    assert_ne!(user_state_hash(&alice_view), Some(bob_self_hash.as_str()));
     // The reversible projection stays same-length decryptable, so it must not
     // take the per-recipient salt: every viewer sees the same value, which the
     // secret alone can invert back to the source hash.
@@ -1646,14 +1645,9 @@ async fn auth_selected_server_id_absent_from_config_scopes_client() {
 #[tokio::test]
 async fn blank_auth_selected_server_id_keeps_incoming_default_server() {
     let server = spawn_test_server(TestServerOpts::default()).await;
-    server.authenticator.register_user_in_server(
-        "alice",
-        None,
-        Some(1),
-        vec![],
-        None,
-        Some(""),
-    );
+    server
+        .authenticator
+        .register_user_in_server("alice", None, Some(1), vec![], None, Some(""));
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -1978,13 +1972,9 @@ async fn auth_no_cert_when_required_rejected() {
 #[tokio::test]
 async fn permission_denied_uses_authenticated_language() {
     let server = spawn_test_server(TestServerOpts::default()).await;
-    server.authenticator.register_user_with_language(
-        "alice",
-        None,
-        Some(1),
-        vec![],
-        spanish(),
-    );
+    server
+        .authenticator
+        .register_user_with_language("alice", None, Some(1), vec![], spanish());
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -2048,13 +2038,9 @@ async fn authenticator_language_wins_over_default_language() {
         ..TestServerOpts::default()
     })
     .await;
-    server.authenticator.register_user_with_language(
-        "alice",
-        None,
-        Some(1),
-        vec![],
-        german(),
-    );
+    server
+        .authenticator
+        .register_user_with_language("alice", None, Some(1), vec![], german());
 
     assert_eq!(
         permission_denied_reason_for_missing_channel(&server, "alice").await,
@@ -2070,13 +2056,9 @@ async fn force_language_overrides_the_authenticator_language() {
         ..TestServerOpts::default()
     })
     .await;
-    server.authenticator.register_user_with_language(
-        "alice",
-        None,
-        Some(1),
-        vec![],
-        spanish(),
-    );
+    server
+        .authenticator
+        .register_user_with_language("alice", None, Some(1), vec![], spanish());
 
     assert_eq!(
         permission_denied_reason_for_missing_channel(&server, "alice").await,

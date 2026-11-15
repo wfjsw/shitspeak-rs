@@ -779,7 +779,9 @@ impl ReplicationTuning {
         // no learned op pace immediately stale; a min above the max can never
         // be satisfied.
         if self.owner_staleness_factor == 0 {
-            return Err("s2s.replications.owner_staleness_factor must be greater than zero".to_owned());
+            return Err(
+                "s2s.replications.owner_staleness_factor must be greater than zero".to_owned(),
+            );
         }
         if self.owner_staleness_min_age_ms == 0 || self.owner_staleness_max_age_ms == 0 {
             return Err(
@@ -841,12 +843,8 @@ impl From<ReplicationTuning> for ReplicationConfig {
             ))
             .with_owner_max_catchup_ops(t.owner_max_catchup_ops)
             .with_owner_staleness_factor(t.owner_staleness_factor)
-            .with_owner_staleness_min_age(Duration::from_millis(
-                t.owner_staleness_min_age_ms,
-            ))
-            .with_owner_staleness_max_age(Duration::from_millis(
-                t.owner_staleness_max_age_ms,
-            ))
+            .with_owner_staleness_min_age(Duration::from_millis(t.owner_staleness_min_age_ms))
+            .with_owner_staleness_max_age(Duration::from_millis(t.owner_staleness_max_age_ms))
             .with_catchup_max_in_flight_total(t.catchup_max_in_flight_total)
             .with_catchup_max_in_flight_per_peer(t.catchup_max_in_flight_per_peer)
             .with_client_replication_max_in_flight(t.client_replication_max_in_flight)

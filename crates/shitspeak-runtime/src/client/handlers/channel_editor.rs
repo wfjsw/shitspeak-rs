@@ -261,7 +261,10 @@ mod tests {
 
         send_channel_editor_reply(&target, 5, acl()).await.unwrap();
 
-        assert_eq!(target.queued(), vec![vec!["name:Lobby", "acl", "name:Lobby"]]);
+        assert_eq!(
+            target.queued(),
+            vec![vec!["name:Lobby", "acl", "name:Lobby"]]
+        );
     }
 
     #[tokio::test]

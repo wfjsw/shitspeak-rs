@@ -26,7 +26,6 @@ use shitspeak_s2s_transport::{
 };
 
 use crate::overlay::config::OverlayConfig;
-use crate::overlay::{DuplicateDetector, HelloObservation};
 use crate::overlay::identity::{
     IdentityProbeResponse, encode_identity_probe_resp, send_identity_probe,
 };
@@ -36,6 +35,7 @@ use crate::overlay::identity_guard::{
 use crate::overlay::lsdb::{AdmissionResult, LinkStateDb, LsaEntry, LsaFloodPacer, LsaFloor};
 use crate::overlay::neighbor::NeighborMonitor;
 use crate::overlay::proto::{OverlayBody, decode_message};
+use crate::overlay::{DuplicateDetector, HelloObservation};
 use crate::testing::transport_cfg;
 
 /// Short guard timings so the decision logic is observable without waiting
@@ -307,7 +307,9 @@ async fn identity_guard_holds_off_while_the_impostor_is_still_live() {
 
     let decisions = decision_counts(&harness.guard);
     assert!(
-        decisions.get(&GuardDecision::CompetitorLive).is_some_and(|n| *n >= 1),
+        decisions
+            .get(&GuardDecision::CompetitorLive)
+            .is_some_and(|n| *n >= 1),
         "the guard must recognise the live competitor: {decisions:?}"
     );
     assert!(
@@ -496,9 +498,10 @@ async fn startup_preflight_refuses_a_sustained_live_overlay_competitor() {
     let peer_port = pick_free_port().await;
     let node_port = pick_free_port().await;
 
-    let (peer, peer_inbound) = ConnectionManager::start(transport_cfg(&pki, 1, loopback(peer_port)))
-        .await
-        .unwrap();
+    let (peer, peer_inbound) =
+        ConnectionManager::start(transport_cfg(&pki, 1, loopback(peer_port)))
+            .await
+            .unwrap();
     let (node, node_inbound) = ConnectionManager::start(
         transport_cfg(&pki, 0, loopback(node_port)).with_seed_target(SeedAddress::new(
             loopback(peer_port).to_string(),
@@ -604,10 +607,7 @@ async fn overlay_dispatcher_answers_identity_probes_about_a_live_neighbour() {
     asker
         .add_address(
             1,
-            shitspeak_s2s_transport::PeerAddress::new(
-                loopback(node1_port),
-                TransportKind::Tcp,
-            ),
+            shitspeak_s2s_transport::PeerAddress::new(loopback(node1_port), TransportKind::Tcp),
         )
         .await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

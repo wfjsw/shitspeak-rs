@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::integration_tests::harness::{
-    TestClient, TestServer, TestServerOpts, spawn_test_server,
+    SAMPLE_OPUS, TestClient, TestServer, TestServerOpts, spawn_test_server,
 };
 use shitspeak_auth::Privilege;
 use shitspeak_messages::messages::Message;
@@ -821,8 +821,6 @@ async fn hide_self_privilege_grants_the_hide_me_toggle() {
         .expect("the toggle switches back to Hide me");
     assert!(!live_carol.is_hidden_from_regular_users());
 }
-
-const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 
 async fn expect_voice_from(recipient: &TestClient, sender: &TestClient, what: &str) {
     let audio = recipient

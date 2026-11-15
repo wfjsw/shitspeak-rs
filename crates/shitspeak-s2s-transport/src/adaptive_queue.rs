@@ -336,7 +336,10 @@ fn available_memory_bytes() -> Option<u64> {
 
 #[cfg(not(windows))]
 fn available_memory_bytes() -> Option<u64> {
-    select_available_memory(parse_cgroup_memory_available(), parse_mem_available_from_proc())
+    select_available_memory(
+        parse_cgroup_memory_available(),
+        parse_mem_available_from_proc(),
+    )
 }
 
 #[cfg(not(windows))]

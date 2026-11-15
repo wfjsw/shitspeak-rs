@@ -25,7 +25,8 @@ use shitspeak_s2s::testing::s2s_network_test_guard;
 
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{
-    TestClient, TestServer, TestServerOpts, spawn_test_server, test_client::ConnectError,
+    SAMPLE_OPUS, TestClient, TestServer, TestServerOpts, spawn_test_server,
+    test_client::ConnectError,
 };
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
@@ -39,7 +40,6 @@ use shitspeak_state::{ACLPermissions, Channel, ChannelPatch};
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);
-const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 const LARGE_TREE_SERVER_BRANCHES: usize = 2;
 const LARGE_TREE_CLIENTS_PER_BRANCH: usize = 500;
 const LARGE_TREE_CLIENTS: usize = LARGE_TREE_SERVER_BRANCHES * LARGE_TREE_CLIENTS_PER_BRANCH;

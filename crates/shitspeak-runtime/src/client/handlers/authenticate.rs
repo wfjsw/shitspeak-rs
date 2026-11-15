@@ -108,8 +108,7 @@ pub async fn handle_authenticate(
             username = %username,
             "authentication rate limit exceeded"
         );
-        return Err(AuthRejection::new(RejectType::AuthenticatorFail)
-        .into());
+        return Err(AuthRejection::new(RejectType::AuthenticatorFail).into());
     }
 
     // ── Authentication context ────────────────────────────────────────────
@@ -153,9 +152,7 @@ pub async fn handle_authenticate(
     };
     // ── Certificate required ──────────────────────────────────────────────
     if auth_config.cert_required && !sender.has_certificate() {
-        return Err(
-            AuthRejection::new(RejectType::NoCertificate).into(),
-        );
+        return Err(AuthRejection::new(RejectType::NoCertificate).into());
     }
 
     let auth_permit = server.acquire_auth_finalization_permit(sender).await?;
@@ -207,8 +204,7 @@ pub async fn handle_authenticate(
         }
     };
     if result.user_id == Some(u32::MAX) {
-        return Err(AuthRejection::new(RejectType::AuthenticatorFail)
-        .into());
+        return Err(AuthRejection::new(RejectType::AuthenticatorFail).into());
     }
 
     result.virtual_server_id = normalize_virtual_server_id(result.virtual_server_id);
@@ -223,8 +219,7 @@ pub async fn handle_authenticate(
                 .move_local_client_to_server(&provisional_server_id, session, &auth_server_id)
                 .await
             else {
-                return Err(AuthRejection::new(RejectType::ServerFull)
-                .into());
+                return Err(AuthRejection::new(RejectType::ServerFull).into());
             };
             session = new_session;
             session_id = new_session;
@@ -260,9 +255,7 @@ pub async fn handle_authenticate(
     if !invisible
         && repo.local_authenticated_client_count_in_server(&server_id) >= auth_config.max_users
     {
-        return Err(
-            AuthRejection::new(RejectType::ServerFull).into(),
-        );
+        return Err(AuthRejection::new(RejectType::ServerFull).into());
     }
 
     // ── Required groups check ─────────────────────────────────────────────
@@ -319,9 +312,7 @@ pub async fn handle_authenticate(
             )
             .await
     {
-        return Err(
-            AuthRejection::new(RejectType::ServerFull).into(),
-        );
+        return Err(AuthRejection::new(RejectType::ServerFull).into());
     }
 
     // ── Traverse permission check on root channel ─────────────────────────
@@ -611,10 +602,7 @@ pub async fn handle_authenticate(
         push_burst(action.into());
     }
     if sender.can_hide_self() {
-        push_burst(
-            crate::toggle_superuser_visibility::action(sender)
-                .into(),
-        );
+        push_burst(crate::toggle_superuser_visibility::action(sender).into());
     }
 
     // 4. ServerSync

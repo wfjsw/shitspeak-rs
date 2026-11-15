@@ -264,9 +264,7 @@ pub fn classify_overlay_body(body: &OverlayBody) -> PacketKind {
         },
         OverlayBody::Data(data) => classify_overlay_data(data),
         OverlayBody::IdentityProbe(_) => PacketKind::from_static("overlay.identity_probe"),
-        OverlayBody::IdentityProbeResp(_) => {
-            PacketKind::from_static("overlay.identity_probe_resp")
-        }
+        OverlayBody::IdentityProbeResp(_) => PacketKind::from_static("overlay.identity_probe_resp"),
         OverlayBody::OriginFenced(_) => PacketKind::from_static("overlay.origin_fenced"),
     }
 }

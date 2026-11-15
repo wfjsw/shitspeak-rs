@@ -257,7 +257,11 @@ impl Localizer {
         Cow::Owned(format_message(&self.lookup(language, key.key()), arguments))
     }
 
-    pub fn channel_does_not_exist(&self, language: &Language, channel_id: u32) -> Cow<'static, str> {
+    pub fn channel_does_not_exist(
+        &self,
+        language: &Language,
+        channel_id: u32,
+    ) -> Cow<'static, str> {
         self.format(
             language,
             TextKey::ChannelDoesNotExist,
@@ -470,7 +474,10 @@ mod tests {
         live.insert(
             language("ja"),
             Catalog::from_entries(HashMap::from([
-                ("reject.ServerFull".to_owned(), "サーバーは満員です".to_owned()),
+                (
+                    "reject.ServerFull".to_owned(),
+                    "サーバーは満員です".to_owned(),
+                ),
                 (
                     "text.ChannelDoesNotExist".to_owned(),
                     "チャンネル {id} は存在しません".to_owned(),

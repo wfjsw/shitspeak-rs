@@ -12,7 +12,7 @@ use futures_util::{
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateOperation;
 use crate::integration_tests::harness::{
-    TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
+    SAMPLE_OPUS, TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
     spawn_s2s_test_server_with_config, test_client::ConnectError, test_user_channel_cache_key,
 };
 use crate::s2s::BanProposalOutcome;
@@ -37,7 +37,6 @@ use shitspeak_state::{BanEntry, BanOp, Channel, ChannelOp};
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
-const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 const S2S_SHOUT_REMOTE_CLIENTS: usize = 500;
 const S2S_SHOUT_CHANNEL_ID: u32 = 42;
 const S2S_SHOUT_TARGET_SLOT: u32 = 7;
@@ -5715,10 +5714,12 @@ async fn s2s_reincarnates_above_an_impostor_epoch_keeping_local_clients() {
         .overlay()
         .expect("node 1 overlay")
         .identity_guard()
-        .report_trigger(shitspeak_s2s::overlay::identity_guard::FenceTrigger::OriginFenced {
-            fence_epoch: impostor_epoch,
-            fence_seq: 1,
-        });
+        .report_trigger(
+            shitspeak_s2s::overlay::identity_guard::FenceTrigger::OriginFenced {
+                fence_epoch: impostor_epoch,
+                fence_seq: 1,
+            },
+        );
 
     let reincarnated = wait_until(Duration::from_secs(90), || {
         a.server
@@ -5755,7 +5756,10 @@ async fn s2s_reincarnates_above_an_impostor_epoch_keeping_local_clients() {
     assert!(
         peer_followed,
         "the peer never adopted the re-incarnated epoch: {:?}",
-        b.server.s2s_manager().overlay().map(|overlay| overlay.members())
+        b.server
+            .s2s_manager()
+            .overlay()
+            .map(|overlay| overlay.members())
     );
 
     // The local client was connected across the S2S restart.
@@ -5821,7 +5825,8 @@ async fn s2s_server_config_max_users_tracks_cluster_membership() {
     let a = spawn_s2s_max_users_node(Arc::clone(&pki), 1, 100, a_s2s_port, b_s2s_port).await;
     let b = spawn_s2s_max_users_node(Arc::clone(&pki), 2, 50, b_s2s_port, a_s2s_port).await;
     wait_for_s2s_pair(&a, &b).await;
-    a.authenticator.register_user("alice", None, Some(1), vec![]);
+    a.authenticator
+        .register_user("alice", None, Some(1), vec![]);
 
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
         .await
@@ -5880,12 +5885,13 @@ async fn s2s_same_channel_text_reaches_remote_co_present_member() {
     let placements_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let b_knows_alice = handle
-                .block_on(b.server.get_clients().get_client_in_server(
-                    crate::types::DEFAULT_SERVER_ID,
-                    alice.server_session,
-                ))
-                .is_some_and(|c| c.get_current_channel_id() == 273);
+            let b_knows_alice =
+                handle
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|c| c.get_current_channel_id() == 273);
             let a_knows_bob = handle
                 .block_on(
                     a.server
@@ -5947,7 +5953,8 @@ async fn s2s_linked_normal_voice_under_shared_sub_acl() {
     wait_for_s2s_pair(&a, &b).await;
     a.authenticator
         .register_superuser("admin", None, Some(1), vec!["admin".into()]);
-    a.authenticator.register_user("alice", None, Some(2), vec![]);
+    a.authenticator
+        .register_user("alice", None, Some(2), vec![]);
     b.authenticator.register_user("bob", None, Some(3), vec![]);
 
     let channels = a.server.get_channels();
@@ -6026,12 +6033,13 @@ async fn s2s_linked_normal_voice_under_shared_sub_acl() {
     let ready = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let b_knows_alice = handle
-                .block_on(b.server.get_clients().get_client_in_server(
-                    crate::types::DEFAULT_SERVER_ID,
-                    alice.server_session,
-                ))
-                .is_some_and(|c| c.get_current_channel_id() == 273);
+            let b_knows_alice =
+                handle
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|c| c.get_current_channel_id() == 273);
             let a_knows_bob = handle
                 .block_on(
                     a.server

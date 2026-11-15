@@ -102,7 +102,9 @@ mod tests {
     use super::Language;
 
     fn languages(tags: &[&str]) -> Vec<Language> {
-        tags.iter().map(|tag| Language::parse(tag).unwrap()).collect()
+        tags.iter()
+            .map(|tag| Language::parse(tag).unwrap())
+            .collect()
     }
 
     #[test]
@@ -123,7 +125,10 @@ mod tests {
         ] {
             let requested = Language::parse(requested).unwrap();
             assert_eq!(
-                requested.negotiate(&available).map(Language::tag).as_deref(),
+                requested
+                    .negotiate(&available)
+                    .map(Language::tag)
+                    .as_deref(),
                 Some(expected),
                 "tag {requested}"
             );
@@ -157,7 +162,10 @@ mod tests {
             let language = Language::parse(tag).unwrap();
             let encoded = serde_json::to_string(&language).unwrap();
             assert_eq!(encoded, format!("\"{tag}\""));
-            assert_eq!(serde_json::from_str::<Language>(&encoded).unwrap(), language);
+            assert_eq!(
+                serde_json::from_str::<Language>(&encoded).unwrap(),
+                language
+            );
         }
     }
 

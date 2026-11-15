@@ -1345,8 +1345,10 @@ async fn config_reload_pushes_recording_allowed_to_authenticated_clients() {
     for recording_allowed in [false, true] {
         write_max_bandwidth_reload_config(&config, &config_path, config.max_bandwidth);
         let mut contents = std::fs::read_to_string(&config_path).expect("read reload config");
-        contents.push_str(&format!("recording_allowed = {recording_allowed}
-"));
+        contents.push_str(&format!(
+            "recording_allowed = {recording_allowed}
+"
+        ));
         std::fs::write(&config_path, contents).expect("write reload config");
         server
             .reload_config_from(&config_path)
@@ -1635,9 +1637,10 @@ async fn reauthentication_with_a_new_language_refreshes_localized_client_state()
     assert_eq!(client.language(), Language::parse("es").unwrap());
     assert_eq!(
         client.text(crate::localization::TextKey::ChannelNameRequired),
-        server
-            .localizer()
-            .text(&Language::parse("es").unwrap(), crate::localization::TextKey::ChannelNameRequired),
+        server.localizer().text(
+            &Language::parse("es").unwrap(),
+            crate::localization::TextKey::ChannelNameRequired
+        ),
         "text generated after reauthentication uses the new language"
     );
 }
@@ -1648,10 +1651,12 @@ async fn gateway_egress_translates_channel_names_for_the_client_language() {
         .await
         .expect("server");
     let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
-    server.channel_name_translations().replace(std::collections::HashMap::from([(
-        Language::parse("es").unwrap(),
-        std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
-    )]));
+    server
+        .channel_name_translations()
+        .replace(std::collections::HashMap::from([(
+            Language::parse("es").unwrap(),
+            std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
+        )]));
     let lobby: Message = shitspeak_messages::messages::encoder::ChannelState {
         channel_id: Some(4),
         name: Some("Lobby".to_owned()),
@@ -1679,10 +1684,12 @@ async fn gateway_egress_supplies_raw_channel_names_with_no_channel_name_translat
         .await
         .expect("server");
     let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
-    server.channel_name_translations().replace(std::collections::HashMap::from([(
-        Language::parse("es").unwrap(),
-        std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
-    )]));
+    server
+        .channel_name_translations()
+        .replace(std::collections::HashMap::from([(
+            Language::parse("es").unwrap(),
+            std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
+        )]));
     client
         .write_global_state_direct()
         .set_privileges(shitspeak_core::Privilege::NoChannelNameTranslation.into());

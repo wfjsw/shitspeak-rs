@@ -13,14 +13,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    SAMPLE_OPUS, TestClient, TestServerOpts, spawn_test_server,
+};
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{ChanAcl, TextMessage, UserState};
 use shitspeak_state::{ACLPermissions, Channel};
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);
-const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 
 fn opus_frame(payload: &crate::voice::codec::AudioPayload) -> &[u8] {
     match payload {
@@ -97,7 +98,12 @@ async fn expect_channel_text(
 
 /// Like [`expect_channel_text`], but for a message addressed to a channel
 /// *subtree*. Those carry the root in `tree_id` and leave `channel_id` empty.
-async fn expect_tree_text(recipient: &TestClient, expected: &str, root: u32, reason: &str) -> Message {
+async fn expect_tree_text(
+    recipient: &TestClient,
+    expected: &str,
+    root: u32,
+    reason: &str,
+) -> Message {
     recipient
         .recv_until(
             |m| {
@@ -298,13 +304,7 @@ async fn linked_normal_voice_under_shared_sub_acl() {
             deny: 0,
         },
     ];
-    admin
-        .set_acls(
-            300,
-            shared_acl.clone(),
-            true,
-        )
-        .await;
+    admin.set_acls(300, shared_acl.clone(), true).await;
     admin.set_acls(273, shared_acl.clone(), true).await;
     admin.set_acls(275, shared_acl, true).await;
 
@@ -321,9 +321,11 @@ async fn linked_normal_voice_under_shared_sub_acl() {
         .await
         .expect("alice is connected");
     let source_perms =
-        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 273).await;
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 273)
+            .await;
     let linked_perms =
-        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 275).await;
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 275)
+            .await;
     assert!(
         source_perms.contains(ACLPermissions::Speak),
         "Alice must hold Speak in her own channel 273"
@@ -577,7 +579,8 @@ async fn listener_of_unrelated_channel_does_not_receive_channel_text() {
         leaked.is_none(),
         "listener of an unrelated channel must not receive 273's text"
     );
-}/// Reproduces the production ACL shape on the 273 subtree: root denies
+}
+/// Reproduces the production ACL shape on the 273 subtree: root denies
 /// Traverse for `all` on subs, the intermediate `Alliances` channel grants
 /// Traverse to `member`/`highsec` with `apply_subs=false`, and only the
 /// destination channels carry Enter/Speak/Listen/TextMessage grants.
@@ -805,7 +808,10 @@ async fn destination_grants_survive_traverse_path_gate_for_occupant() {
     )
     .await;
     let denied = bot
-        .recv_until(|m| matches!(m, Message::PermissionDenied(_)), NEGATIVE_WINDOW)
+        .recv_until(
+            |m| matches!(m, Message::PermissionDenied(_)),
+            NEGATIVE_WINDOW,
+        )
         .await;
     assert!(
         denied.is_none(),
@@ -827,12 +833,9 @@ async fn destination_grants_survive_traverse_path_gate_for_occupant() {
         "stranger must not have been moved into the subtree"
     );
 
-    let stranger_view = crate::client::acl::compute_permissions_for_client(
-        &server.server,
-        &stranger_server,
-        273,
-    )
-    .await;
+    let stranger_view =
+        crate::client::acl::compute_permissions_for_client(&server.server, &stranger_server, 273)
+            .await;
     assert!(
         stranger_view.is_empty(),
         "the ancestor Traverse barrier must still wipe 273's grants for a client \

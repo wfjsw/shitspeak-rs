@@ -739,6 +739,12 @@ impl Server {
         resolver.lookup_ip_metadata(ip).await
     }
 
+    /// City-level location and ASN for a client address.
+    pub async fn lookup_client_geo(&self, ip: std::net::IpAddr) -> Option<crate::geoip::ClientGeo> {
+        let resolver = self.geoip_resolver.read().clone();
+        resolver.lookup_client_geo(ip).await
+    }
+
     pub fn authenticator_watch_paths(&self) -> Vec<PathBuf> {
         let config = self.read_config();
         let mut paths = Vec::new();
@@ -900,9 +906,8 @@ impl Server {
                         break;
                     }
                     let purged = clients.remove_all_remote_origins().await;
-                    let epoch = shitspeak_s2s::overlay::reserve_boot_epoch_floor(
-                        request.floor_epoch,
-                    );
+                    let epoch =
+                        shitspeak_s2s::overlay::reserve_boot_epoch_floor(request.floor_epoch);
                     tracing::info!(
                         floor_epoch = request.floor_epoch,
                         new_epoch = epoch,
@@ -917,6 +922,7 @@ impl Server {
                 self.s2s_manager.clone(),
                 self.clients.clone(),
                 self.channels.clone(),
+                Arc::downgrade(self),
             ));
         let observability_metrics_task = {
             let metrics = self.read_config().observability.metrics.clone();

@@ -129,9 +129,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
                     .send_unicast(from, &rt.topic, OwnerBody::CatchupResp(response))
                     .await
                 {
-                    metrics::record_owner_send_failure(
-                        metrics::OwnerSendFailureKind::CatchupResp,
-                    );
+                    metrics::record_owner_send_failure(metrics::OwnerSendFailureKind::CatchupResp);
                     warn!(
                         from=%from,
                         origin=%origin,
@@ -804,9 +802,7 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             .await
         {
             metrics::record_owner_send_failure(metrics::OwnerSendFailureKind::Followup);
-            if let Some(observed) =
-                sampled_owner_followup_failure(&OWNER_FOLLOWUP_FAILURES)
-            {
+            if let Some(observed) = sampled_owner_followup_failure(&OWNER_FOLLOWUP_FAILURES) {
                 warn!(
                     origin=%origin,
                     error=%e,

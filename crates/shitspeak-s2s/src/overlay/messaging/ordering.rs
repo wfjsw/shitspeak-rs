@@ -1084,8 +1084,10 @@ mod tests {
             &OverlayConfig::new(Vec::new()).with_ordered_retry_initial(Duration::from_millis(10)),
         );
         let out_of_order = data(2, b"third");
-        let nacks_before =
-            metric_value("shitspeak_s2s_overlay_ordered_nacks_total", &[("lane", "7")]);
+        let nacks_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_nacks_total",
+            &[("lane", "7")],
+        );
 
         let first = ordering
             .accept_inbound(
@@ -1132,8 +1134,10 @@ mod tests {
 
         // Every emitted (non-coalesced) NACK is exported on the counter.
         assert!(
-            metric_value("shitspeak_s2s_overlay_ordered_nacks_total", &[("lane", "7")])
-                >= nacks_before + 2
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_nacks_total",
+                &[("lane", "7")]
+            ) >= nacks_before + 2
         );
     }
 
@@ -1298,7 +1302,12 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert!(ordering.pending_range(87, lane_with(8), 0, 0).await.is_empty());
+        assert!(
+            ordering
+                .pending_range(87, lane_with(8), 0, 0)
+                .await
+                .is_empty()
+        );
         assert!(
             !has_pending_gauge(87, 8),
             "retry-cap expiry must release the exported gauge"
@@ -1774,10 +1783,7 @@ mod tests {
         starved.dsts = vec![85];
         // Allocate the sequence the way the originate loop does; the
         // store_pending helper itself never touches outbound_next.
-        assert_eq!(
-            ordering.next_outbound_seq(85, lane_with(5)).await,
-            0
-        );
+        assert_eq!(ordering.next_outbound_seq(85, lane_with(5)).await, 0);
         ordering.store_pending(lane_with(5), starved).await;
 
         let _ = ordering
@@ -1805,10 +1811,7 @@ mod tests {
         );
         // Sequence continuity is kept: the next sequence continues past
         // the allocated one (a full reset_peer would rewind it to zero).
-        assert_eq!(
-            ordering.next_outbound_seq(85, lane_with(5)).await,
-            1
-        );
+        assert_eq!(ordering.next_outbound_seq(85, lane_with(5)).await, 1);
         assert!(
             !has_pending_gauge(85, 5),
             "the purged window must release its exported gauge"

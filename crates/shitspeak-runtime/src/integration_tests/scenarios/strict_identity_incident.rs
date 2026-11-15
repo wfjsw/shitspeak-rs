@@ -143,12 +143,15 @@ async fn duplicate_identity_incident_fences_then_recovers_automatically() {
         [&node1, &node2, &node4].iter().all(|server| {
             let manager = server.server.s2s_manager();
             manager.application().is_some()
-                && manager.replications().as_ref().is_some_and(|replications| {
-                    replications.strict_capability_activation_ready()
+                && manager
+                    .replications()
+                    .as_ref()
+                    .is_some_and(|replications| replications.strict_capability_activation_ready())
+                && [1u16, 2, 4].iter().all(|peer| {
+                    manager
+                        .overlay()
+                        .is_some_and(|o| o.alive_members().contains(peer))
                 })
-                && [1u16, 2, 4]
-                    .iter()
-                    .all(|peer| manager.overlay().is_some_and(|o| o.alive_members().contains(peer)))
         })
     })
     .await;
@@ -224,10 +227,7 @@ async fn duplicate_identity_incident_fences_then_recovers_automatically() {
     //    higher epoch and be re-adopted, with no manual restart.
     impostor.shutdown_gracefully().await;
 
-    let recovered = wait_until(RECOVERY, || {
-        local_boot_epoch(&node2) > impostor_epoch
-    })
-    .await;
+    let recovered = wait_until(RECOVERY, || local_boot_epoch(&node2) > impostor_epoch).await;
     assert!(
         recovered,
         "node 2 never re-incarnated above the impostor's epoch: {} vs {impostor_epoch}",

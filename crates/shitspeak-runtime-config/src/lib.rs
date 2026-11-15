@@ -1149,7 +1149,10 @@ impl PrivacyConfig {
 
     /// Extends this configuration with the superuser-protection flag, which
     /// decides whether superuser viewers see remapped certificate hashes too.
-    pub fn with_superuser_protection(mut self, protect_certificate_hashes_for_superusers: bool) -> Self {
+    pub fn with_superuser_protection(
+        mut self,
+        protect_certificate_hashes_for_superusers: bool,
+    ) -> Self {
         self.protect_certificate_hashes_for_superusers = protect_certificate_hashes_for_superusers;
         self
     }
@@ -2144,10 +2147,12 @@ mod tests {
         let config = parse_config(MINIMAL_CONFIG).expect("minimal config parses");
         assert!(config.recording_allowed);
 
-        let config = parse_config(&format!("{MINIMAL_CONFIG}
+        let config = parse_config(&format!(
+            "{MINIMAL_CONFIG}
 recording_allowed = false
-"))
-            .expect("recording_allowed config parses");
+"
+        ))
+        .expect("recording_allowed config parses");
         assert!(!config.recording_allowed);
     }
 
@@ -2166,9 +2171,11 @@ recording_allowed = false
 
     #[test]
     fn default_language_only_fills_in_an_absent_request() {
-        let raw = format!("{MINIMAL_CONFIG}
+        let raw = format!(
+            "{MINIMAL_CONFIG}
 default_language = \"es\"
-");
+"
+        );
         let config = parse_config(&raw).expect("config parses");
 
         assert_eq!(config.resolve_language(None), language("es"));
@@ -2180,11 +2187,12 @@ default_language = \"es\"
 
     #[test]
     fn force_language_overrides_default_and_requested_languages() {
-        let raw =
-            format!("{MINIMAL_CONFIG}
+        let raw = format!(
+            "{MINIMAL_CONFIG}
 default_language = \"es\"
 force_language = \"zh-CN\"
-");
+"
+        );
         let config = parse_config(&raw).expect("config parses");
 
         assert_eq!(config.default_language, language("es"));
@@ -2204,9 +2212,11 @@ force_language = \"zh-CN\"
     fn language_tags_without_a_bundled_catalog_still_load() {
         // Catalogs can arrive at runtime from Weblate, so only the tag's
         // syntax is validated at load time.
-        let raw = format!("{MINIMAL_CONFIG}
+        let raw = format!(
+            "{MINIMAL_CONFIG}
 default_language = \"kl\"
-");
+"
+        );
         let config = parse_config(&raw).expect("well-formed tag loads");
         assert_eq!(config.default_language, language("kl"));
     }
@@ -2236,7 +2246,9 @@ default_language = \"kl\"
         );
         let config = parse_config(&raw).expect("config parses");
 
-        let sync = config.translation_sync.expect("translation sync configured");
+        let sync = config
+            .translation_sync
+            .expect("translation sync configured");
         assert!(sync.enabled());
         assert_eq!(sync.weblate().url(), "https://weblate.example");
         assert_eq!(sync.weblate().project(), "shitspeak");
@@ -2272,9 +2284,11 @@ default_language = \"kl\"
 
     #[test]
     fn malformed_language_tags_are_rejected_at_load() {
-        let raw = format!("{MINIMAL_CONFIG}
+        let raw = format!(
+            "{MINIMAL_CONFIG}
 default_language = \"not a tag!\"
-");
+"
+        );
 
         let error = parse_config(&raw).expect_err("malformed language must not load");
         assert!(

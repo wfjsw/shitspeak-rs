@@ -312,7 +312,10 @@ mod tests {
             .iter()
             .map(|summary| (summary.language_code().to_owned(), summary.is_source()))
             .collect();
-        assert_eq!(codes, vec![("en".to_owned(), true), ("es".to_owned(), false)]);
+        assert_eq!(
+            codes,
+            vec![("en".to_owned(), true), ("es".to_owned(), false)]
+        );
     }
 
     #[tokio::test]
@@ -341,8 +344,14 @@ mod tests {
         mock.set_translation("x_key", true, &[("Lobby", "Lobby")]);
         let client = client(&mock, Some("wlu_secret"));
 
-        client.add_source_string("x_key", "Lobby", "Lobby").await.unwrap();
-        client.add_source_string("x_key", "Music", "Music").await.unwrap();
+        client
+            .add_source_string("x_key", "Lobby", "Lobby")
+            .await
+            .unwrap();
+        client
+            .add_source_string("x_key", "Music", "Music")
+            .await
+            .unwrap();
 
         assert_eq!(mock.added_keys(), vec!["Music".to_owned()]);
         let keys: HashSet<String> = client
@@ -352,13 +361,19 @@ mod tests {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
-        assert_eq!(keys, HashSet::from(["Lobby".to_owned(), "Music".to_owned()]));
+        assert_eq!(
+            keys,
+            HashSet::from(["Lobby".to_owned(), "Music".to_owned()])
+        );
     }
 
     #[tokio::test]
     async fn http_errors_surface_with_status() {
         let mock = MockWeblate::start().await;
-        let error = client(&mock, None).translated_units("missing").await.unwrap_err();
+        let error = client(&mock, None)
+            .translated_units("missing")
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, WeblateError::Status { status, .. } if status == StatusCode::NOT_FOUND),
             "unexpected error: {error}"

@@ -651,10 +651,8 @@ impl Default for OverlayTuning {
             ordered_retry_max_age_ms: default_ordered_retry_max_age_ms(),
             ordered_retry_max_attempts: default_ordered_retry_max_attempts(),
             ordered_pending_starve_after_ms: default_ordered_pending_starve_after_ms(),
-            ordered_pending_starve_purge_after_ms:
-                default_ordered_pending_starve_purge_after_ms(),
-            ordered_inbound_gap_heal_after_ms:
-                default_ordered_inbound_gap_heal_after_ms(),
+            ordered_pending_starve_purge_after_ms: default_ordered_pending_starve_purge_after_ms(),
+            ordered_inbound_gap_heal_after_ms: default_ordered_inbound_gap_heal_after_ms(),
             route_next_hop_backoff_ms: default_route_next_hop_backoff_ms(),
             route_next_hop_backoff_failures: default_route_next_hop_backoff_failures(),
         }
@@ -702,9 +700,7 @@ impl OverlayTuning {
             .with_ordered_inbound_gap_heal_after(Duration::from_millis(
                 self.ordered_inbound_gap_heal_after_ms,
             ))
-            .with_route_next_hop_backoff(Duration::from_millis(
-                self.route_next_hop_backoff_ms,
-            ))
+            .with_route_next_hop_backoff(Duration::from_millis(self.route_next_hop_backoff_ms))
             .with_route_next_hop_backoff_failures(self.route_next_hop_backoff_failures)
     }
 }

@@ -1871,7 +1871,6 @@ struct MoqActiveSpeaker {
     channel_id: u32,
 }
 
-
 fn voice_target_kind(target: VoiceTarget) -> VoiceTargetKind {
     match target {
         VoiceTarget::Normal => VoiceTargetKind::Normal,

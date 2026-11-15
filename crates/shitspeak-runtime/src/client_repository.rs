@@ -2085,7 +2085,10 @@ impl ClientRepository {
         &self,
         server_id: &str,
     ) -> Option<Arc<[Arc<Box<Client>>]>> {
-        self.promiscuous_local_clients.read().get(server_id).cloned()
+        self.promiscuous_local_clients
+            .read()
+            .get(server_id)
+            .cloned()
     }
 
     /// Nodes per server hosting a promiscuous client, local or replicated.

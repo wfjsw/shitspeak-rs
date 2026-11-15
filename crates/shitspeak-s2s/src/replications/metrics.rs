@@ -1851,11 +1851,10 @@ impl Default for OwnerStalenessMetrics {
 
 impl OwnerStalenessMetrics {
     pub(crate) fn record_scan(&self, alive: usize, stale: usize, max_age_ms: u64) {
-        self.last_scan_alive_origins
-            .store(alive, Ordering::Relaxed);
-        self.last_scan_stale_origins
-            .store(stale, Ordering::Relaxed);
-        self.last_scan_max_age_ms.store(max_age_ms, Ordering::Relaxed);
+        self.last_scan_alive_origins.store(alive, Ordering::Relaxed);
+        self.last_scan_stale_origins.store(stale, Ordering::Relaxed);
+        self.last_scan_max_age_ms
+            .store(max_age_ms, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> (usize, usize, u64) {
@@ -3061,8 +3060,8 @@ mod tests {
     fn owner_staleness_and_send_failure_metrics_use_bounded_labels() {
         let before_stale = OWNER_STALENESS_PROBES[OwnerStalenessProbeOutcome::StaleArmed.index()]
             .load(Ordering::Relaxed);
-        let before_followup = OWNER_SEND_FAILURES[OwnerSendFailureKind::Followup.index()]
-            .load(Ordering::Relaxed);
+        let before_followup =
+            OWNER_SEND_FAILURES[OwnerSendFailureKind::Followup.index()].load(Ordering::Relaxed);
         record_owner_staleness_probe(OwnerStalenessProbeOutcome::StaleArmed);
         record_owner_staleness_probe(OwnerStalenessProbeOutcome::NoEvidence);
         record_owner_send_failure(OwnerSendFailureKind::Followup);

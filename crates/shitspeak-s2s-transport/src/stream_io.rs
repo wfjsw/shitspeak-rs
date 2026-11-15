@@ -1675,19 +1675,13 @@ where
                     "session-control frame received outside the Control lane",
                 ));
             }
-            let attestation = cfg
-                .dial_started_at
-                .and_then(|not_before| {
-                    crate::duplicate_identity::decode_attestation(frame.payload.as_ref(), not_before)
-                });
-            inbound
-                .duplicate_identity()
-                .report(DuplicateIdentityEvidence::rejected_by_peer(
-                    cfg.transport,
-                    None,
-                    cfg.peer_node,
-                )
-                .with_attestation(attestation));
+            let attestation = cfg.dial_started_at.and_then(|not_before| {
+                crate::duplicate_identity::decode_attestation(frame.payload.as_ref(), not_before)
+            });
+            inbound.duplicate_identity().report(
+                DuplicateIdentityEvidence::rejected_by_peer(cfg.transport, None, cfg.peer_node)
+                    .with_attestation(attestation),
+            );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "peer rejected this node id: a live session from a known endpoint holds it",

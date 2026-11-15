@@ -74,9 +74,15 @@ pub enum FenceTrigger {
     /// own origin is already known there.
     OriginFenced { fence_epoch: u64, fence_seq: u64 },
     /// An LSA claiming our own origin arrived from the network.
-    ForeignSelfLsa { foreign_epoch: u64, foreign_seq: u64 },
+    ForeignSelfLsa {
+        foreign_epoch: u64,
+        foreign_seq: u64,
+    },
     /// Our own local LSA was rejected by the local LSDB.
-    LocalLsaSuppressed { foreign_epoch: u64, foreign_seq: u64 },
+    LocalLsaSuppressed {
+        foreign_epoch: u64,
+        foreign_seq: u64,
+    },
 }
 
 impl FenceTrigger {
@@ -164,7 +170,13 @@ impl IdentityGuard {
         transport: ConnectionManager,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        Self::with_tuning(self_id, local_epoch, transport, shutdown, GuardTuning::default())
+        Self::with_tuning(
+            self_id,
+            local_epoch,
+            transport,
+            shutdown,
+            GuardTuning::default(),
+        )
     }
 
     pub(crate) fn with_tuning(
@@ -206,7 +218,9 @@ impl IdentityGuard {
     }
 
     /// The re-incarnation request stream, one entry per decision.
-    pub fn reincarnation_requests(&self) -> tokio::sync::watch::Receiver<Option<ReincarnationRequest>> {
+    pub fn reincarnation_requests(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<ReincarnationRequest>> {
         self.reincarnation.subscribe()
     }
 
@@ -231,11 +245,7 @@ impl IdentityGuard {
 
     /// Deliver a probe answer from a peer. Called by the overlay dispatcher.
     pub fn deliver_probe_response(&self, response: IdentityProbeResponse) {
-        let sender = self
-            .state
-            .lock()
-            .pending_probes
-            .remove(&response.nonce);
+        let sender = self.state.lock().pending_probes.remove(&response.nonce);
         if let Some(sender) = sender {
             let _ = sender.send(response);
         }
@@ -332,14 +342,8 @@ impl IdentityGuard {
                 state.pending_probes.insert(nonce, tx);
                 (nonce, rx)
             };
-            let sent = send_identity_probe(
-                &self.transport,
-                self.self_id,
-                peer,
-                self.self_id,
-                nonce,
-            )
-            .await;
+            let sent =
+                send_identity_probe(&self.transport, self.self_id, peer, self.self_id, nonce).await;
             match sent {
                 Some(_) => receivers.push(rx),
                 None => {
@@ -411,18 +415,16 @@ mod tests {
 
     #[test]
     fn triggers_at_or_below_the_local_epoch_are_ignored() {
-        assert!(
-            !matches!(
-                // A trigger is dropped before reaching the state when its
-                // epoch is not strictly higher.
-                FenceTrigger::OriginFenced {
-                    fence_epoch: 5,
-                    fence_seq: 1
-                }
-                .fence_epoch(),
-                epoch if epoch > 5
-            )
-        );
+        assert!(!matches!(
+            // A trigger is dropped before reaching the state when its
+            // epoch is not strictly higher.
+            FenceTrigger::OriginFenced {
+                fence_epoch: 5,
+                fence_seq: 1
+            }
+            .fence_epoch(),
+            epoch if epoch > 5
+        ));
     }
 
     #[test]
@@ -459,10 +461,7 @@ mod tests {
         state.record(GuardDecision::Debouncing);
         state.record(GuardDecision::Debouncing);
         state.record(GuardDecision::Requested);
-        assert_eq!(
-            state.decisions.get(&GuardDecision::Debouncing),
-            Some(&2)
-        );
+        assert_eq!(state.decisions.get(&GuardDecision::Debouncing), Some(&2));
         assert_eq!(state.decisions.get(&GuardDecision::Requested), Some(&1));
     }
 }

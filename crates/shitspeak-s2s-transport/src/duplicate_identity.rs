@@ -59,9 +59,7 @@ impl LivenessAttestation {
     /// `boot_start` is when this process began; a hello older than that can
     /// only belong to an earlier incarnation of this very node.
     pub fn proves_alive_after(&self, boot_start: Instant) -> bool {
-        self.not_before
-            .saturating_duration_since(boot_start)
-            > self.hello_age
+        self.not_before.saturating_duration_since(boot_start) > self.hello_age
     }
 }
 
@@ -75,13 +73,22 @@ pub type IdentityLivenessOracle =
 pub(crate) fn encode_attestation(attestation: &LivenessAttestation) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&attestation.boot_epoch.to_le_bytes());
-    out.extend_from_slice(&attestation.hello_age.as_micros().min(u64::MAX as u128).to_le_bytes());
+    out.extend_from_slice(
+        &attestation
+            .hello_age
+            .as_micros()
+            .min(u64::MAX as u128)
+            .to_le_bytes(),
+    );
     out
 }
 
 /// Decode a refusal notice payload. `not_before` is the instant the dial
 /// that produced the notice was started.
-pub(crate) fn decode_attestation(payload: &[u8], not_before: Instant) -> Option<LivenessAttestation> {
+pub(crate) fn decode_attestation(
+    payload: &[u8],
+    not_before: Instant,
+) -> Option<LivenessAttestation> {
     if payload.len() != 16 {
         return None;
     }

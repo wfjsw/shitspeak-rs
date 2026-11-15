@@ -77,7 +77,7 @@ pub async fn handle_channel_remove(
         }
     } else if !result.is_proposed() {
         return Err(super::channel_op_propose_failed(
-                    sender,
+            sender,
             Some(channel_id),
             result.failure_reason(),
         ));

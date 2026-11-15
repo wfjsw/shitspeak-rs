@@ -99,7 +99,11 @@ impl TranslationCache {
     /// Record a key that was just added to the source language, so it is
     /// not pushed again before the next download of the source language.
     pub(crate) fn insert_source_key(&mut self, key: &str) {
-        if let Some(source) = self.languages.values_mut().find(|language| language.is_source) {
+        if let Some(source) = self
+            .languages
+            .values_mut()
+            .find(|language| language.is_source)
+        {
             source.entries.insert(key.to_owned(), key.to_owned());
         }
     }
@@ -126,7 +130,10 @@ impl TranslationCache {
 
     /// Write the cache atomically: a crash never leaves a truncated file.
     pub(crate) fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         let temporary = path.with_extension("tmp");
@@ -183,7 +190,12 @@ pub(crate) trait WeblateSyncJob: Send + 'static {
     fn initial_cache(&self, server: &Server) -> Option<TranslationCache>;
 
     /// Refresh `cache` from Weblate and apply it.
-    async fn poll(&mut self, server: &Arc<Box<Server>>, client: &WeblateClient, cache: &mut TranslationCache);
+    async fn poll(
+        &mut self,
+        server: &Arc<Box<Server>>,
+        client: &WeblateClient,
+        cache: &mut TranslationCache,
+    );
 
     /// The integration was disabled by a config reload: stop serving live
     /// translations.
@@ -281,7 +293,10 @@ fn load_cache_for(config: &TranslationSyncConfig) -> Option<TranslationCache> {
 
 /// Apply the on-disk cache of live server-message translations, if any.
 pub(crate) fn load_translation_cache(server: &Server) {
-    if let Some(cache) = active_translation_sync(server).as_ref().and_then(load_cache_for) {
+    if let Some(cache) = active_translation_sync(server)
+        .as_ref()
+        .and_then(load_cache_for)
+    {
         apply_translation_cache(server, &cache);
     }
 }
@@ -291,14 +306,22 @@ struct ServerTextSync;
 #[async_trait]
 impl WeblateSyncJob for ServerTextSync {
     fn target(&self, server: &Server) -> Option<(WeblateComponentConfig, Duration)> {
-        active_translation_sync(server).map(|config| (config.weblate().clone(), config.poll_interval()))
+        active_translation_sync(server)
+            .map(|config| (config.weblate().clone(), config.poll_interval()))
     }
 
     fn initial_cache(&self, server: &Server) -> Option<TranslationCache> {
-        active_translation_sync(server).as_ref().and_then(load_cache_for)
+        active_translation_sync(server)
+            .as_ref()
+            .and_then(load_cache_for)
     }
 
-    async fn poll(&mut self, server: &Arc<Box<Server>>, client: &WeblateClient, cache: &mut TranslationCache) {
+    async fn poll(
+        &mut self,
+        server: &Arc<Box<Server>>,
+        client: &WeblateClient,
+        cache: &mut TranslationCache,
+    ) {
         match refresh_translations(client, cache).await {
             Ok(true) => {
                 tracing::info!(
@@ -338,7 +361,13 @@ mod tests {
     use crate::localization::weblate_mock::MockWeblate;
 
     fn client(mock: &MockWeblate) -> WeblateClient {
-        WeblateClient::new(&WeblateComponentConfig::new(mock.url(), "proj", "comp", None)).unwrap()
+        WeblateClient::new(&WeblateComponentConfig::new(
+            mock.url(),
+            "proj",
+            "comp",
+            None,
+        ))
+        .unwrap()
     }
 
     #[tokio::test]
@@ -405,7 +434,10 @@ mod tests {
         cache.save(&path).unwrap();
 
         assert_eq!(TranslationCache::load(&path), Some(cache));
-        assert_eq!(TranslationCache::load(&directory.path().join("missing.json")), None);
+        assert_eq!(
+            TranslationCache::load(&directory.path().join("missing.json")),
+            None
+        );
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(TranslationCache::load(&path), None);
     }

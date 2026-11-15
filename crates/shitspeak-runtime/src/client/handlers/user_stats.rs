@@ -272,13 +272,15 @@ fn udp_network_stats(
 }
 
 fn packet_stats_to_proto(
-    (good, late, lost, resync): (u32, u32, u32, u32),
+    (good, late, lost, resync): (u64, u64, u64, u64),
 ) -> shitspeak_proto::mumble_proto::user_stats::Stats {
+    // The proto carries u32 fields; report the ceiling rather than wrapping.
+    let clamp = |counter: u64| u32::try_from(counter).unwrap_or(u32::MAX);
     shitspeak_proto::mumble_proto::user_stats::Stats {
-        good: Some(good),
-        late: Some(late),
-        lost: Some(lost),
-        resync: Some(resync),
+        good: Some(clamp(good)),
+        late: Some(clamp(late)),
+        lost: Some(clamp(lost)),
+        resync: Some(clamp(resync)),
     }
 }
 

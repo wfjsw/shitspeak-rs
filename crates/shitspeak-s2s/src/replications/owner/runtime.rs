@@ -1069,8 +1069,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 let state = self.state.lock();
                 if state.inactive_origins.contains(&origin) {
                     ScanObservation::Inactive
-                } else if let Some((known_epoch, known_version)) =
-                    state.known.get(&origin).copied()
+                } else if let Some((known_epoch, known_version)) = state.known.get(&origin).copied()
                 {
                     match state
                         .origin_staleness
@@ -1152,8 +1151,11 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 }
             }
         }
-        self.staleness_metrics
-            .record_scan(alive_scanned, stale_armed, max_age_seen.as_millis().min(u64::MAX as u128) as u64);
+        self.staleness_metrics.record_scan(
+            alive_scanned,
+            stale_armed,
+            max_age_seen.as_millis().min(u64::MAX as u128) as u64,
+        );
     }
 
     async fn request_catchup(
@@ -2157,19 +2159,14 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let request = loop {
-            if let Some(found) = net
-                .captured
-                .lock()
-                .iter()
-                .find_map(|frame| match frame {
-                    CapturedFrame::OwnerUnicast {
-                        dst,
-                        body: OwnerBody::CatchupReq(req),
-                        ..
-                    } => Some((*dst, req.clone())),
-                    _ => None,
-                })
-            {
+            if let Some(found) = net.captured.lock().iter().find_map(|frame| match frame {
+                CapturedFrame::OwnerUnicast {
+                    dst,
+                    body: OwnerBody::CatchupReq(req),
+                    ..
+                } => Some((*dst, req.clone())),
+                _ => None,
+            }) {
                 break Some(found);
             }
             assert!(
@@ -2230,19 +2227,14 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let request = loop {
-            if let Some(found) = net
-                .captured
-                .lock()
-                .iter()
-                .find_map(|frame| match frame {
-                    CapturedFrame::OwnerUnicast {
-                        dst,
-                        body: OwnerBody::CatchupReq(req),
-                        ..
-                    } => Some((*dst, req.clone())),
-                    _ => None,
-                })
-            {
+            if let Some(found) = net.captured.lock().iter().find_map(|frame| match frame {
+                CapturedFrame::OwnerUnicast {
+                    dst,
+                    body: OwnerBody::CatchupReq(req),
+                    ..
+                } => Some((*dst, req.clone())),
+                _ => None,
+            }) {
                 break Some(found);
             }
             assert!(

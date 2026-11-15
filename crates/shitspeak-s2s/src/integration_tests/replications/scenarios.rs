@@ -2855,9 +2855,7 @@ async fn owner_silent_origin_recovers_via_relays() {
     // replication frame from A — both its op broadcasts and its catchup
     // responses — while A stays a live overlay member (LSA/Hello traffic is
     // unaffected). B's own requests to A still flow, as in the incident.
-    cluster
-        .managers[1]
-        .set_inbound_filter(move |frame| frame.from != a_id);
+    cluster.managers[1].set_inbound_filter(move |frame| frame.from != a_id);
 
     // A keeps generating ops; none of them reach B's owner runtime.
     for k in 0..20u64 {
@@ -2877,4 +2875,3 @@ async fn owner_silent_origin_recovers_via_relays() {
     assert_eq!(repos[1].known_versions().get(&1), Some(&(epoch_a, 30)));
     cluster.shutdown().await;
 }
-

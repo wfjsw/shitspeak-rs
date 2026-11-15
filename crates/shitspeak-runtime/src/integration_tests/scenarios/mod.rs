@@ -8,6 +8,7 @@ pub mod channel_tree;
 pub mod listener_semantics;
 pub mod localization;
 pub mod mod_actions;
+pub mod observability;
 pub mod privileges;
 pub mod s2s;
 pub mod self_actions;

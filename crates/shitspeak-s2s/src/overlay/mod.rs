@@ -464,7 +464,8 @@ pub async fn duplicate_startup_identity_preflight(
             next_probe = now + probe_every;
         }
 
-        let wait = (next_probe.min(deadline)).saturating_duration_since(tokio::time::Instant::now());
+        let wait =
+            (next_probe.min(deadline)).saturating_duration_since(tokio::time::Instant::now());
         if let Ok(Some(msg)) = timeout(
             wait.max(Duration::from_millis(5)),
             recv_preflight_any(&mut control, &mut high, &mut regular),

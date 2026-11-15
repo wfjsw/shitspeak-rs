@@ -2,8 +2,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rustls_pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};

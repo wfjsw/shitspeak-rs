@@ -150,15 +150,18 @@ mod tests {
 
     #[test]
     fn channel_op_failure_does_not_leak_internal_s2s_details() {
-        let spanish =
-            ClientLocale::default().with_language(crate::localization::Language::parse("es").unwrap());
+        let spanish = ClientLocale::default()
+            .with_language(crate::localization::Language::parse("es").unwrap());
         let reason = denied_reason(channel_op_failure(
             8,
             &spanish,
             Some(42),
             Some("non-owner attempted to propose on owner-mode topic owned by 7"),
         ));
-        assert!(!reason.contains("owner"), "internal detail leaked: {reason}");
+        assert!(
+            !reason.contains("owner"),
+            "internal detail leaked: {reason}"
+        );
         assert_eq!(
             reason,
             "No se pudo completar la operación del canal; inténtalo de nuevo"

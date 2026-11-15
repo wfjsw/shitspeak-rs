@@ -25,11 +25,11 @@ use bytes::Bytes;
 use tracing::{debug, warn};
 
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{ConnectionManager, MessageClass, SendOptions, ServiceLevel};
 use shitspeak_proto::s2s_overlay_proto as pb;
+use shitspeak_s2s_transport::{ConnectionManager, MessageClass, SendOptions, ServiceLevel};
 
 use super::duplicate::HelloObservation;
-use super::lsdb::{LsaFloor, LinkStateDb};
+use super::lsdb::{LinkStateDb, LsaFloor};
 use super::proto::{OverlayBody, decode_message, encode_message, wrap};
 
 /// One Hello/HelloAck observation reported by a peer.
@@ -132,7 +132,10 @@ pub fn encode_identity_probe_resp(
                 age_us: observation.age.as_micros().min(u64::MAX as u128) as u64,
             })
             .collect(),
-        lsdb_epoch: lsdb_entry.as_ref().map(|entry| entry.boot_epoch).unwrap_or(0),
+        lsdb_epoch: lsdb_entry
+            .as_ref()
+            .map(|entry| entry.boot_epoch)
+            .unwrap_or(0),
         lsdb_seq: lsdb_entry.as_ref().map(|entry| entry.seq).unwrap_or(0),
         floor_epoch: floor_entry.map(|entry| entry.boot_epoch).unwrap_or(0),
         floor_seq: floor_entry.map(|entry| entry.seq).unwrap_or(0),
@@ -150,12 +153,11 @@ pub async fn send_identity_probe(
     nonce: u64,
 ) -> Option<Instant> {
     let payload = encode_identity_probe(subject, nonce)?;
-    let packet_kind = crate::debug_io::classify_overlay_body(&OverlayBody::IdentityProbe(
-        pb::IdentityProbe {
+    let packet_kind =
+        crate::debug_io::classify_overlay_body(&OverlayBody::IdentityProbe(pb::IdentityProbe {
             nonce,
             subject: u32::from(subject),
-        },
-    ));
+        }));
     let payload_len = payload.len();
     match transport
         .try_send_with_options(
@@ -235,13 +237,9 @@ pub async fn handle_identity_probe(
     let Ok(subject) = NodeIdentifier::try_from(probe.subject) else {
         return;
     };
-    let Some(payload) = encode_identity_probe_resp(
-        subject,
-        probe.nonce,
-        hello_observations,
-        lsdb,
-        floor,
-    ) else {
+    let Some(payload) =
+        encode_identity_probe_resp(subject, probe.nonce, hello_observations, lsdb, floor)
+    else {
         warn!(peer = sender, "identity probe response encode failed");
         return;
     };

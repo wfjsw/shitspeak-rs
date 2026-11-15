@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::client::client_udp_loss;
 use crate::client_repository::ClientRepository;
 use crate::constants;
 use crate::http_client;
@@ -274,10 +275,36 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
     }
 }
 
+/// How many clients one sampler slice covers before it yields.
+const GEOIP_YIELD_EVERY: usize = 64;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CityKey {
+    server_id: String,
+    region: String,
+    city: String,
+    latitude: String,
+    longitude: String,
+}
+
+#[derive(Default)]
+struct ClientLinkSamples {
+    /// `shitspeak_clients_by_region` gauges.
+    region: Vec<PrometheusSample>,
+    /// `shitspeak_clients_by_city` gauges.
+    city: Vec<PrometheusSample>,
+    /// `shitspeak_client_udp_*` series.
+    udp: Vec<PrometheusSample>,
+}
+
 pub struct ServerMetricsSource {
     s2s: Arc<S2SManager>,
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
+    /// Weak so the source never keeps the server' shutdown from completing;
+    /// only the GeoIP resolver lookup needs it, and a later reload swaps the
+    /// resolver in place.
+    server: std::sync::Weak<Box<crate::server::Server>>,
 }
 
 impl ServerMetricsSource {
@@ -285,11 +312,13 @@ impl ServerMetricsSource {
         s2s: Arc<S2SManager>,
         clients: Arc<ClientRepository>,
         channels: Arc<ChannelRepository>,
+        server: std::sync::Weak<Box<crate::server::Server>>,
     ) -> Self {
         Self {
             s2s,
             clients,
             channels,
+            server,
         }
     }
 
@@ -308,6 +337,97 @@ impl ServerMetricsSource {
 
     fn client_projection_samples(&self) -> Vec<PrometheusSample> {
         samples_with_node_label(client_projection_samples(), self.clients.local_node_id())
+    }
+
+    /// One pass over the local clients that yields the per-client UDP link
+    /// series plus the region and city distributions the heatmaps read.
+    ///
+    /// Only locals are sampled: a projected remote client has no crypt state
+    /// here and its owning node exports the same link. Buckets are keyed and
+    /// sorted so scrape output stays stable between calls.
+    async fn client_link_samples(&self) -> ClientLinkSamples {
+        let Some(server) = self.server.upgrade() else {
+            return ClientLinkSamples::default();
+        };
+        let local_node_id = self.clients.local_node_id();
+        let (clients, _) = self.clients.snapshot_with_versions().await;
+        let mut samples = ClientLinkSamples {
+            udp: Vec::with_capacity(clients.len() * 10),
+            ..ClientLinkSamples::default()
+        };
+
+        let mut regions: HashMap<(String, String), usize> = HashMap::new();
+        let mut cities: HashMap<CityKey, usize> = HashMap::new();
+        for (index, client) in clients.iter().enumerate() {
+            if client.get_node_id() != local_node_id {
+                continue;
+            }
+            // Nothing in the GeoIP path awaits, so without this the whole
+            // pass would hold one runtime worker for the duration of a scrape.
+            if index % GEOIP_YIELD_EVERY == 0 {
+                tokio::task::yield_now().await;
+            }
+            // GeoIP: asn/country behind the resolver cache, the city read
+            // uncached. A disabled database answers `None`, which lands every
+            // client in the "unknown" buckets.
+            let geo = server.lookup_client_geo(client.get_real_ip_address()).await;
+            let location = client_udp_loss::ClientLocation::from_geo(geo.as_ref());
+            *regions
+                .entry((client.server_id(), location.region().to_owned()))
+                .or_insert(0) += 1;
+            *cities
+                .entry(CityKey {
+                    server_id: client.server_id(),
+                    region: location.region().to_owned(),
+                    city: location.city().to_owned(),
+                    latitude: location.latitude().to_owned(),
+                    longitude: location.longitude().to_owned(),
+                })
+                .or_insert(0) += 1;
+            if let Some(series) =
+                client_udp_loss::client_udp_link_series(client, local_node_id, location)
+            {
+                samples.udp.extend(series.prometheus_samples());
+            }
+        }
+
+        let mut regions = regions.into_iter().collect::<Vec<_>>();
+        regions.sort_by(|left, right| left.0.cmp(&right.0));
+        samples.region = regions
+            .into_iter()
+            .map(|((server_id, region), count)| {
+                PrometheusSample::new(
+                    "shitspeak_clients_by_region",
+                    vec![
+                        ("node".to_owned(), local_node_id.to_string()),
+                        ("server_id".to_owned(), server_id),
+                        ("region".to_owned(), region),
+                    ],
+                    count as f64,
+                )
+            })
+            .collect();
+
+        let mut cities = cities.into_iter().collect::<Vec<_>>();
+        cities.sort_by(|left, right| left.0.cmp(&right.0));
+        samples.city = cities
+            .into_iter()
+            .map(|(key, count)| {
+                PrometheusSample::new(
+                    "shitspeak_clients_by_city",
+                    vec![
+                        ("node".to_owned(), local_node_id.to_string()),
+                        ("server_id".to_owned(), key.server_id),
+                        ("region".to_owned(), key.region),
+                        ("city".to_owned(), key.city),
+                        ("lat".to_owned(), key.latitude),
+                        ("lon".to_owned(), key.longitude),
+                    ],
+                    count as f64,
+                )
+            })
+            .collect();
+        samples
     }
 
     fn build_info_samples(&self) -> Vec<PrometheusSample> {
@@ -329,6 +449,11 @@ impl S2sMetricsSource for ServerMetricsSource {
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
         render_voice_metrics_into(&mut body, &self.voice_samples());
         render_client_projection_metrics_into(&mut body, &self.client_projection_samples());
+        let client_link = self.client_link_samples().await;
+        render_client_udp_metrics_into(&mut body, &client_link.udp);
+        let mut geo = client_link.city;
+        geo.extend(client_link.region);
+        render_client_geo_metrics_into(&mut body, &geo);
         Some(body)
     }
 
@@ -343,6 +468,10 @@ impl S2sMetricsSource for ServerMetricsSource {
         samples.extend(self.consensus_samples().await);
         samples.extend(self.voice_samples());
         samples.extend(self.client_projection_samples());
+        let client_link = self.client_link_samples().await;
+        samples.extend(client_link.udp);
+        samples.extend(client_link.city);
+        samples.extend(client_link.region);
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -675,6 +804,93 @@ fn client_projection_samples() -> Vec<PrometheusSample> {
 
     samples
 }
+
+fn render_client_udp_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    for (name, help, kind) in CLIENT_UDP_METRIC_HEADERS {
+        render_prometheus_header(out, name, help, kind);
+    }
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+// CLIENT_UDP_LOSS_PROMQL uplink:
+// Uplink loss per client — one client, or everybody?
+// topk(10, shitspeak_client_udp_packet_loss_ratio{node="12", direction="uplink"})
+// Node-wide uplink loss — everybody:
+// sum by (node) (rate(shitspeak_client_udp_packets_total{node="12", direction="uplink", result="lost"}[5m]))
+//   / sum by (node) (rate(shitspeak_client_udp_packets_total{node="12", direction="uplink", result=~"good|late|lost"}[5m]))
+// Same split by region — some regions:
+// sum by (region) (rate(shitspeak_client_udp_packets_total{node="12", direction="uplink", result="lost"}[5m]))
+//   / sum by (region) (rate(shitspeak_client_udp_packets_total{node="12", direction="uplink", result=~"good|late|lost"}[5m]))
+// Same split by network or ingress path — one link:
+// ... sum by (asn) / sum by (subnet) / sum by (entrypoint) over the same selectors.
+// Reordering rather than loss: compare the late share of the same denominators.
+// Downlink is the same queries with direction="downlink", as reported by the clients themselves.
+// Search with: rg "CLIENT_UDP_LOSS_PROMQL"
+// CLIENT_GEO_HEATMAP_PROMQL:
+// Who each virtual server is actually serving, by client GeoIP city.
+//
+// City is the working resolution: a country heatmap is one blob per country and
+// hides the ISP/route split that actually varies, while per-IP is too hot to chart.
+//
+// Panel 1 — geomap (`shitspeak-clients-by-city`, marker layer):
+//   query:    shitspeak_clients_by_city{node="12", server_id="default"}
+//   location: Coords, lat field = label `lat`, lon field = label `lon`
+//   size:     value; legend/name = {{city}}, {{region}}
+// Rows without coordinates (GeoIP off, or a country-only record) drop out of the
+// map but stay visible in panel 2.
+//
+// Panel 2 — heatmap (`client-density-by-city`):
+//   query:  shitspeak_clients_by_city{node="12", server_id="default"}
+//   format: Time series, Y bucket by series, legend {{region}}/{{city}}
+//   the `unknown` row is expected and collects private/GeoIP-less clients.
+//
+// Panel 3 — loss over the same map (share of uplink packets lost per city):
+//   sum by (server_id, region, city, lat, lon)
+//     (rate(shitspeak_client_udp_packets_total{direction="uplink", result="lost"}[5m]))
+//     / sum by (server_id, region, city, lat, lon)
+//     (rate(shitspeak_client_udp_packets_total{direction="uplink", result=~"good|late|lost"}[5m]))
+//   Same geomap/heatmap shape with the ratio as the value; a city that is red
+//   here while its neighbours are not is a city-level route problem.
+//
+// Cluster-wide view: drop node/server_id from the selectors and aggregate with
+// sum by (region, city, lat, lon).
+// Search with: rg "CLIENT_GEO_HEATMAP_PROMQL"
+fn render_client_geo_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    for (name, help, kind) in CLIENT_GEO_METRIC_HEADERS {
+        render_prometheus_header(out, name, help, kind);
+    }
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+const CLIENT_GEO_METRIC_HEADERS: &[(&str, &str, &str)] = &[
+    (
+        "shitspeak_clients_by_city",
+        "Current clients per virtual server by GeoIP city, with coordinates for geomap and heatmap panels; `city`/`region` are `unknown` and `lat`/`lon` empty when GeoIP has no answer.",
+        "gauge",
+    ),
+    (
+        "shitspeak_clients_by_region",
+        "Current clients per virtual server by GeoIP region (ISO 3166-1 alpha-2), for country-level rollups; `unknown` covers private ranges and a disabled GeoIP database.",
+        "gauge",
+    ),
+];
+
+const CLIENT_UDP_METRIC_HEADERS: &[(&str, &str, &str)] = &[
+    (
+        "shitspeak_client_udp_packets_total",
+        "Per-client UDP packets by direction and decryptor verdict: `good`, `late` (filled an earlier gap), `lost` (never arrived) and `resync` (re-key). `late` moves one packet out of `lost`, so treat the counters as monotonic only once reordering has settled.",
+        "counter",
+    ),
+    (
+        "shitspeak_client_udp_packet_loss_ratio",
+        "Per-client fraction of the sender's packets that never arrived, by direction: `uplink` is measured here, `downlink` is reported by the client in its own pings.",
+        "gauge",
+    ),
+];
 
 fn render_client_projection_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
     for (name, help) in CLIENT_PROJECTION_METRIC_HEADERS {
@@ -1728,6 +1944,41 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_voice_udp_egress_datagrams_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_queue_status gauge\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_queue_enqueues_total counter\n"));
+    }
+
+    #[test]
+    fn client_geo_metric_renders_heatmap_coordinates() {
+        let samples = vec![PrometheusSample::new(
+            "shitspeak_clients_by_city",
+            vec![
+                ("node".to_owned(), "12".to_owned()),
+                ("server_id".to_owned(), "default".to_owned()),
+                ("region".to_owned(), "DE".to_owned()),
+                ("city".to_owned(), "Frankfurt am Main".to_owned()),
+                ("lat".to_owned(), "50.1109".to_owned()),
+                ("lon".to_owned(), "8.6821".to_owned()),
+            ],
+            3.0,
+        )];
+        let mut rendered = String::new();
+        render_client_geo_metrics_into(&mut rendered, &samples);
+
+        assert!(rendered.contains("# TYPE shitspeak_clients_by_city gauge\n"));
+        assert!(rendered.contains("# TYPE shitspeak_clients_by_region gauge\n"));
+        assert!(rendered.contains(
+            "shitspeak_clients_by_city{node=\"12\",server_id=\"default\",region=\"DE\",city=\"Frankfurt am Main\",lat=\"50.1109\",lon=\"8.6821\"} 3"
+        ));
+    }
+
+    #[test]
+    fn client_udp_metric_headers_expose_both_directions() {
+        let mut rendered = String::new();
+        render_client_udp_metrics_into(&mut rendered, &[]);
+
+        assert!(rendered.contains("# TYPE shitspeak_client_udp_packets_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_client_udp_packet_loss_ratio gauge\n"));
+        assert!(rendered.contains("# HELP shitspeak_client_udp_packets_total"));
+        assert!(rendered.contains("`resync`"));
     }
 
     #[test]

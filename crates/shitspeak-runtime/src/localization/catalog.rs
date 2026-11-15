@@ -327,12 +327,11 @@ mod tests {
     fn non_string_leaves_are_rejected() {
         assert_eq!(
             Catalog::from_json(r#"{"reject": {"WrongUserPw": 3}}"#),
-            Err(CatalogError::NonStringValue("reject.WrongUserPw".to_owned()))
+            Err(CatalogError::NonStringValue(
+                "reject.WrongUserPw".to_owned()
+            ))
         );
-        assert_eq!(
-            Catalog::from_json("[]"),
-            Err(CatalogError::NotAnObject)
-        );
+        assert_eq!(Catalog::from_json("[]"), Err(CatalogError::NotAnObject));
     }
 
     #[test]
@@ -346,7 +345,10 @@ mod tests {
     #[test]
     fn validation_drops_unknown_keys_placeholder_mismatches_and_empty_strings() {
         let source = catalog(&[
-            ("text.ChannelDoesNotExist", "Channel {channel_id} does not exist"),
+            (
+                "text.ChannelDoesNotExist",
+                "Channel {channel_id} does not exist",
+            ),
             ("text.Plain", "Plain"),
             ("text.Empty", "Empty"),
         ]);
@@ -408,7 +410,10 @@ mod tests {
     #[test]
     fn formatting_substitutes_named_placeholders() {
         assert_eq!(
-            format_message("Channel {channel_id} of {channel_id}", &[("channel_id", "7")]),
+            format_message(
+                "Channel {channel_id} of {channel_id}",
+                &[("channel_id", "7")]
+            ),
             "Channel 7 of 7"
         );
         assert_eq!(format_message("Keep {other}", &[]), "Keep {other}");

@@ -181,14 +181,19 @@ pub(crate) fn record_inbound_drop(reason: InboundDropReason, lane: u32) {
 /// Snapshot of one (dst, lane) pending window as observed by a retransmit
 /// pass. Called while the pending map is already locked; takes only the
 /// metrics lock.
-pub(crate) fn record_ordered_pending(dst: NodeIdentifier, lane: u32, packets: u64, oldest_age_ms: u64) {
-    ORDERED_PENDING
-        .lock()
-        .unwrap()
-        .insert((dst, lane), PendingGauges {
+pub(crate) fn record_ordered_pending(
+    dst: NodeIdentifier,
+    lane: u32,
+    packets: u64,
+    oldest_age_ms: u64,
+) {
+    ORDERED_PENDING.lock().unwrap().insert(
+        (dst, lane),
+        PendingGauges {
             packets,
             oldest_age_ms,
-        });
+        },
+    );
 }
 
 /// Remove the (dst, lane) pending gauge once the window is fully released
@@ -428,12 +433,7 @@ mod tests {
 
     #[test]
     fn ordered_and_forwarding_metrics_use_bounded_labels() {
-        let before_nack = ORDERED_NACKS
-            .lock()
-            .unwrap()
-            .get(&7)
-            .copied()
-            .unwrap_or(0);
+        let before_nack = ORDERED_NACKS.lock().unwrap().get(&7).copied().unwrap_or(0);
         record_no_route_drop(NoRouteKind::Control, 9);
         record_reliable_originate_failure(ReliableOriginateFailure::NoRoute);
         record_window_full(0x4f57_4e52);
@@ -530,10 +530,11 @@ mod tests {
         remove_ordered_pending(9, 8);
         let samples = prometheus_samples();
         assert!(
-            !samples.iter().any(|sample| sample
-                .name()
+            !samples.iter().any(|sample| sample.name()
                 == "shitspeak_s2s_overlay_ordered_pending_packets"
-                && sample.labels().contains(&("dst".to_owned(), "9".to_owned()))),
+                && sample
+                    .labels()
+                    .contains(&("dst".to_owned(), "9".to_owned()))),
             "released pending window must not keep a stale gauge"
         );
     }

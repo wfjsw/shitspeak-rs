@@ -16,8 +16,8 @@ use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow
 use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
-use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::localization::{ClientLocale, TextKey};
+use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::messages::encoder::{CodecVersion, RejectType, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime::types::DEFAULT_SERVER_ID;

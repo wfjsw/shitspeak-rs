@@ -142,9 +142,7 @@ fn record_next_hop_send_failure(
         entry.until = Some(now + Duration::from_millis(backoff_ms));
         entry.consecutive = 0;
         drop(backed_off);
-        ordering_metrics::record_next_hop_backoff(
-            ordering_metrics::NextHopBackoffEvent::Activated,
-        );
+        ordering_metrics::record_next_hop_backoff(ordering_metrics::NextHopBackoffEvent::Activated);
         debug!(
             %next_hop,
             ?metric,
@@ -203,7 +201,9 @@ mod next_hop_backoff_test_support {
     static BACKOFF_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     pub(crate) fn backoff_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        BACKOFF_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        BACKOFF_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Replace the process-wide backoff state for one test. Must be
@@ -610,8 +610,7 @@ pub(crate) async fn originate_with_attachments(
                 ordering_metrics::record_reliable_originate_failure(
                     ReliableOriginateFailure::from_error(&err),
                 );
-                if let Some(observed) = sampled_drop_count(&RELIABLE_ORIGINATE_FAILURE_LOGS)
-                {
+                if let Some(observed) = sampled_drop_count(&RELIABLE_ORIGINATE_FAILURE_LOGS) {
                     warn!(
                         dst = %dst,
                         lane = lane.get(),
@@ -5222,7 +5221,9 @@ mod tests {
         .expect("a no-route control drop is still Ok");
 
         assert!(
-            timeout(Duration::from_millis(25), to_four.recv()).await.is_err(),
+            timeout(Duration::from_millis(25), to_four.recv())
+                .await
+                .is_err(),
             "no route in either metric: nothing may be sent"
         );
     }

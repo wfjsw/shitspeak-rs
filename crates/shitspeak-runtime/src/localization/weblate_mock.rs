@@ -74,7 +74,12 @@ impl MockWeblate {
     }
 
     /// Replace a language with fully translated `entries`.
-    pub(crate) fn set_translation(&self, language_code: &str, is_source: bool, entries: &[(&str, &str)]) {
+    pub(crate) fn set_translation(
+        &self,
+        language_code: &str,
+        is_source: bool,
+        entries: &[(&str, &str)],
+    ) {
         let mut state = self.state.lock();
         state.translations.insert(
             language_code.to_owned(),
@@ -269,10 +274,18 @@ fn respond(base: &str, state: &Mutex<MockState>, request: Request) -> (u16, Stri
     let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
     let segments: Vec<String> = url
         .path_segments()
-        .map(|segments| segments.filter(|segment| !segment.is_empty()).map(str::to_owned).collect())
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default();
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let page: usize = query.get("page").and_then(|page| page.parse().ok()).unwrap_or(1);
+    let page: usize = query
+        .get("page")
+        .and_then(|page| page.parse().ok())
+        .unwrap_or(1);
     let page_size = state.page_size.unwrap_or(usize::MAX);
 
     match (request.method.as_str(), segments.as_slice()) {

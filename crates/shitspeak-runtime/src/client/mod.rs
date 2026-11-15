@@ -5,6 +5,7 @@ mod client_instance_id;
 pub mod client_local_state;
 pub mod client_session_identifier;
 pub mod client_stats;
+pub(crate) mod client_udp_loss;
 pub mod global_state_guard;
 pub mod handlers;
 pub mod options;

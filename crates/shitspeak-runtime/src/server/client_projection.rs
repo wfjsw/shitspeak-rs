@@ -896,9 +896,9 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                     crate::localization::channel_names::ChannelNameRefresh::Translations(
                         change,
                     ) => self.append_channel_name_refresh(&server, change, &mut outbound),
-                    crate::localization::channel_names::ChannelNameRefresh::ClientNames(instance)
-                        if *instance == self.client.client_instance_id() =>
-                    {
+                    crate::localization::channel_names::ChannelNameRefresh::ClientNames(
+                        instance,
+                    ) if *instance == self.client.client_instance_id() => {
                         self.append_all_channel_names(&server, &mut outbound).await;
                     }
                     crate::localization::channel_names::ChannelNameRefresh::ClientNames(_) => {}

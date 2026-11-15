@@ -46,14 +46,14 @@ pub struct CryptDecryptor {
     last_good_time: DateTime<Utc>,
     last_resync_request_time: DateTime<Utc>,
 
-    good: u32,
-    late: u32,
-    lost: u32,
-    resync: u32,
-    remote_good: u32,
-    remote_late: u32,
-    remote_lost: u32,
-    remote_resync: u32,
+    good: u64,
+    late: u64,
+    lost: u64,
+    resync: u64,
+    remote_good: u64,
+    remote_late: u64,
+    remote_lost: u64,
+    remote_resync: u64,
 
     decrypt_history: [u8; DECRYPT_HISTORY_SIZE],
 }
@@ -231,11 +231,11 @@ impl CryptState {
         self.decryptor.update_from_ping_message(ping_message);
     }
 
-    pub fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn local_packet_stats(&self) -> (u64, u64, u64, u64) {
         self.decryptor.local_packet_stats()
     }
 
-    pub fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn remote_packet_stats(&self) -> (u64, u64, u64, u64) {
         self.decryptor.remote_packet_stats()
     }
 
@@ -390,7 +390,7 @@ impl CryptDecryptor {
             return;
         }
         self.decrypt_iv.copy_from_slice(iv);
-        self.resync = self.resync.wrapping_add(1);
+        self.resync = self.resync.saturating_add(1);
     }
 
     /// Whether a nonce resync request is due: no good packet and no request
@@ -483,12 +483,12 @@ impl CryptDecryptor {
                 if incoming_iv_byte > known_iv_byte {
                     self.lost = self
                         .lost
-                        .wrapping_add(incoming_iv_byte as u32 - known_iv_byte as u32 - 1);
+                        .saturating_add(u64::from(incoming_iv_byte - known_iv_byte - 1));
                     self.decrypt_iv[0] = incoming_iv_byte;
                 } else if incoming_iv_byte < known_iv_byte {
-                    self.lost = self
-                        .lost
-                        .wrapping_add(256 - known_iv_byte as u32 + incoming_iv_byte as u32 - 1);
+                    self.lost = self.lost.saturating_add(
+                        256 - u64::from(known_iv_byte) + u64::from(incoming_iv_byte) - 1,
+                    );
                     self.decrypt_iv[0] = incoming_iv_byte;
                     for byte in self.decrypt_iv.iter_mut().skip(1) {
                         *byte = byte.wrapping_add(1);
@@ -536,17 +536,17 @@ impl CryptDecryptor {
     }
 
     pub fn update_from_ping_message(&mut self, ping_message: &Ping) {
-        self.remote_good = ping_message.good;
-        self.remote_late = ping_message.late;
-        self.remote_lost = ping_message.lost;
-        self.remote_resync = ping_message.resync;
+        self.remote_good = u64::from(ping_message.good);
+        self.remote_late = u64::from(ping_message.late);
+        self.remote_lost = u64::from(ping_message.lost);
+        self.remote_resync = u64::from(ping_message.resync);
     }
 
-    pub fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn local_packet_stats(&self) -> (u64, u64, u64, u64) {
         (self.good, self.late, self.lost, self.resync)
     }
 
-    pub fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn remote_packet_stats(&self) -> (u64, u64, u64, u64) {
         (
             self.remote_good,
             self.remote_late,
@@ -557,10 +557,12 @@ impl CryptDecryptor {
 
     pub fn create_ping_response(&self, ping_message: &Ping) -> Ping {
         Ping {
-            good: self.good,
-            late: self.late,
-            lost: self.lost,
-            resync: self.resync,
+            // The wire carries u32 counters; a session that outlives the
+            // clamp keeps its accuracy on our side and reports the ceiling.
+            good: clamp_to_wire(self.good),
+            late: clamp_to_wire(self.late),
+            lost: clamp_to_wire(self.lost),
+            resync: clamp_to_wire(self.resync),
             timestamp: ping_message.timestamp,
             udp_packets: None,
             tcp_packets: None,
@@ -570,6 +572,12 @@ impl CryptDecryptor {
             tcp_ping_var: None,
         }
     }
+}
+
+/// Packet counters are kept wide so a long session cannot wrap them; the ping
+/// wire format is `uint32`, so the ceiling is reported instead.
+fn clamp_to_wire(counter: u64) -> u32 {
+    u32::try_from(counter).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -710,6 +718,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Counters outlive the `uint32` ping wire format: they must keep counting
+    /// past it and report the ceiling instead of wrapping back to a small
+    /// number that looks like a counter reset.
+    #[test]
+    fn counters_outgrow_the_wire_width_without_wrapping() {
+        let (_, mut decryptor) = receiver().into_split();
+        decryptor.good = u64::from(u32::MAX) + 5;
+        decryptor.lost = 7;
+
+        assert_eq!(decryptor.local_packet_stats().0, u64::from(u32::MAX) + 5);
+        let ping = decryptor.create_ping_response(&Ping::default());
+        assert_eq!(ping.good, u32::MAX, "clamped, not wrapped");
+        assert_eq!(ping.lost, 7);
     }
 
     #[test]

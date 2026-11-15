@@ -658,7 +658,16 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
         .note_observed_remote_addr(TransportKind::Quic, remote_addr);
     let protocol = negotiated_quic_protocol_or_close(&conn)?;
     record_quic_negotiation(protocol, QuicProtocolResult::Success);
-    install_quic_connection(&inner, peer_node, Some(remote_addr), false, None, conn, protocol).await?;
+    install_quic_connection(
+        &inner,
+        peer_node,
+        Some(remote_addr),
+        false,
+        None,
+        conn,
+        protocol,
+    )
+    .await?;
     Ok(())
 }
 
@@ -679,15 +688,14 @@ fn report_duplicate_identity_close(
         let attestation = dial_started_at.and_then(|not_before| {
             super::super::duplicate_identity::decode_attestation(close.reason.as_ref(), not_before)
         });
-        inner
-            .inbound()
-            .duplicate_identity()
-            .report(DuplicateIdentityEvidence::rejected_by_peer(
+        inner.inbound().duplicate_identity().report(
+            DuplicateIdentityEvidence::rejected_by_peer(
                 TransportKind::Quic,
                 remote_addr,
                 peer_node,
             )
-            .with_attestation(attestation));
+            .with_attestation(attestation),
+        );
     }
 }
 
@@ -757,8 +765,15 @@ async fn install_quic_connection(
             Ok(())
         }
         QuicProtocolVersion::V2 => {
-            install_quic_v2_session(inner, peer_node, remote_addr, is_dialer, dial_started_at, conn)
-                .await
+            install_quic_v2_session(
+                inner,
+                peer_node,
+                remote_addr,
+                is_dialer,
+                dial_started_at,
+                conn,
+            )
+            .await
         }
     }
 }
@@ -859,13 +874,13 @@ async fn install_quic_v2_session(
             Ok(lanes) => lanes,
             Err(error) => {
                 report_duplicate_identity_close(
-                        inner,
-                        &conn,
-                        peer_node,
-                        remote_addr,
-                        is_dialer,
-                        dial_started_at,
-                    );
+                    inner,
+                    &conn,
+                    peer_node,
+                    remote_addr,
+                    is_dialer,
+                    dial_started_at,
+                );
                 record_quic_setup_error(&error);
                 record_quic_protocol_event(
                     QuicProtocolStage::Setup,
