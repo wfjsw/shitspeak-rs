@@ -9850,7 +9850,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum (shitspeak_local_authenticated_clients{job=~\"$job\"})",
+          "expr": "sum (shitspeak_local_authenticated_clients{job=~\"$job\",node=~\"$node\"})",
           "instant": false,
           "legendFormat": "clients",
           "range": true,
@@ -9927,7 +9927,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "instant": false,
           "legendFormat": "uplink loss",
           "range": true,
@@ -10004,7 +10004,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "instant": false,
           "legendFormat": "downlink loss",
           "range": true,
@@ -10068,7 +10068,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",result=\"resync\"}[$__rate_interval]))",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",result=\"resync\"}[$__rate_interval]))",
           "instant": false,
           "legendFormat": "resyncs",
           "range": true,
@@ -10191,7 +10191,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city, lat, lon) (shitspeak_clients_by_city{job=~\"$job\",lat!=\"\"})",
+          "expr": "sum by (region, city, lat, lon) (shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\",lat!=\"\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10224,7 +10224,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Share of uplink packets lost per GeoIP city over the rate interval, marker colour = loss. A red city among green neighbours is a city-level route problem.",
+      "description": "Share of uplink packets lost per GeoIP city over the rate interval, marker colour = loss. A red city among green neighbours is a city-level route problem. Pin it to specific nodes with the Client node selector at the top of the dashboard (All = whole cluster).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -10345,7 +10345,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\",lat!=\"\"}[$__rate_interval])) / (sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\",lat!=\"\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\",lat!=\"\"}[$__rate_interval])) / (sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\",lat!=\"\"}[$__rate_interval])) > 0)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10462,7 +10462,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (shitspeak_local_authenticated_clients{job=~\"$job\"})",
+          "expr": "sum by (node) (shitspeak_local_authenticated_clients{job=~\"$job\",node=~\"$node\"})",
           "legendFormat": "node {{node}}",
           "range": true,
           "refId": "A"
@@ -10560,7 +10560,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (shitspeak_clients_by_region{job=~\"$job\"})",
+          "expr": "sum by (region) (shitspeak_clients_by_region{job=~\"$job\",node=~\"$node\"})",
           "legendFormat": "{{region}}",
           "range": true,
           "refId": "A"
@@ -10574,7 +10574,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Connected clients for the 15 largest GeoIP cities over time (cities without a GeoIP answer are excluded). Each row is one city.",
+      "description": "Connected clients for the 15 cities with the highest peak client count in the selected time range (cities without a GeoIP answer are excluded). Each row is one city; the set of rows is fixed for the whole range. Capped at 200 points per row to stay under the status-history point limit.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -10600,14 +10600,15 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 13,
         "w": 24,
         "x": 0,
         "y": 392
       },
       "id": 123,
+      "maxDataPoints": 200,
       "options": {
-        "colWidth": 0.9,
+        "colWidth": 1,
         "legend": {
           "displayMode": "list",
           "placement": "bottom",
@@ -10629,7 +10630,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(15, sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\",city!=\"unknown\"}))",
+          "expr": "sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\",city!=\"unknown\"}) and on (region, city) topk(15, sum by (region, city) (max_over_time(shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\",city!=\"unknown\"}[$__range] @ end())))",
           "legendFormat": "{{city}}, {{region}}",
           "range": true,
           "refId": "A"
@@ -10766,7 +10767,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 400
+        "y": 405
       },
       "id": 124,
       "options": {
@@ -10787,7 +10788,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\"})",
+          "expr": "sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10799,7 +10800,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10811,7 +10812,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10932,7 +10933,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 409
+        "y": 414
       },
       "id": 125,
       "options": {
@@ -10961,7 +10962,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "uplink node {{node}}",
           "range": true,
           "refId": "A"
@@ -10972,7 +10973,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "downlink node {{node}}",
           "range": true,
           "refId": "B"
@@ -11064,7 +11065,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 409
+        "y": 414
       },
       "id": 126,
       "options": {
@@ -11093,7 +11094,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "uplink {{entrypoint}}",
           "range": true,
           "refId": "A"
@@ -11104,7 +11105,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "downlink {{entrypoint}}",
           "range": true,
           "refId": "B"
@@ -11196,7 +11197,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 417
+        "y": 422
       },
       "id": 127,
       "options": {
@@ -11225,7 +11226,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "uplink {{region}}",
           "range": true,
           "refId": "A"
@@ -11236,7 +11237,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "downlink {{region}}",
           "range": true,
           "refId": "B"
@@ -11328,7 +11329,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 417
+        "y": 422
       },
       "id": 128,
       "options": {
@@ -11357,7 +11358,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
           "legendFormat": "uplink AS{{asn}}",
           "range": true,
           "refId": "A"
@@ -11368,7 +11369,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
           "legendFormat": "downlink AS{{asn}}",
           "range": true,
           "refId": "B"
@@ -11460,7 +11461,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 425
+        "y": 430
       },
       "id": 129,
       "options": {
@@ -11489,7 +11490,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
           "legendFormat": "uplink {{subnet}}",
           "range": true,
           "refId": "A"
@@ -11500,7 +11501,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
           "legendFormat": "downlink {{subnet}}",
           "range": true,
           "refId": "B"
@@ -11592,7 +11593,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 425
+        "y": 430
       },
       "id": 130,
       "options": {
@@ -11621,7 +11622,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "uplink {{region}}",
           "range": true,
           "refId": "A"
@@ -11632,7 +11633,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "legendFormat": "downlink {{region}}",
           "range": true,
           "refId": "B"
@@ -11723,7 +11724,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 433
+        "y": 438
       },
       "id": 131,
       "options": {
@@ -11744,7 +11745,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk(15, shitspeak_client_udp_packet_loss_ratio{job=~\"$job\"} and on (node, server_id, session, direction) (sum by (node, server_id, session, direction) (shitspeak_client_udp_packets_total{job=~\"$job\",result=~\"good|late|lost\"}) >= 500))",
+          "expr": "topk(15, shitspeak_client_udp_packet_loss_ratio{job=~\"$job\",node=~\"$node\"} and on (node, server_id, session, direction) (sum by (node, server_id, session, direction) (shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",result=~\"good|late|lost\"}) >= 500))",
           "format": "table",
           "instant": true,
           "range": false,
@@ -11762,19 +11763,22 @@
               "instance": true,
               "job": true,
               "lat": true,
-              "lon": true
+              "lon": true,
+              "service_name": true,
+              "service_type": true,
+              "session": true,
+              "source": true
             },
             "indexByName": {
-              "Value": 9,
-              "asn": 6,
-              "city": 5,
+              "Value": 8,
+              "asn": 5,
+              "city": 4,
               "direction": 0,
-              "entrypoint": 8,
+              "entrypoint": 7,
               "node": 1,
-              "region": 4,
+              "region": 3,
               "server_id": 2,
-              "session": 3,
-              "subnet": 7
+              "subnet": 6
             },
             "renameByName": {
               "Value": "Loss"
@@ -11830,6 +11834,33 @@
         "regex": "",
         "regexApplyTo": "value",
         "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".+",
+        "current": {
+          "text": "All nodes",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(shitspeak_local_authenticated_clients{job=~\"$job\"}, node)",
+        "description": "Filters every panel in the Client UDP Link and GeoIP row to one or more nodes (the node a client is connected to / whose UDP link is measured). All = whole cluster.",
+        "includeAll": true,
+        "label": "Client node",
+        "multi": true,
+        "name": "node",
+        "options": [],
+        "query": {
+          "query": "label_values(shitspeak_local_authenticated_clients{job=~\"$job\"}, node)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "regexApplyTo": "value",
+        "sort": 3,
         "type": "query"
       }
     ]

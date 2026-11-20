@@ -10,7 +10,8 @@ S2S topology metrics.
   packet IO, a node globe, and a client UDP link / GeoIP section (per-client
   uplink and client-reported downlink loss split by node, entrypoint, region,
   ASN and subnet, local client counts per node, client location maps, and a
-  worst-links table).
+  worst-links table). The `Client node` variable at the top of the dashboard
+  filters every panel in that section to one or more nodes (default: all).
 - `provisioning/dashboards/shitspeak-s2s.yaml`: Grafana dashboard provider.
 - `provisioning/datasources/mimir.yaml`: configurable Prometheus/Mimir
   datasource.
