@@ -184,6 +184,26 @@ async fn a_udp_client_reaches_the_scrape_with_its_link_attribution() {
         "city gauge missing or not counting the client:\n{text}"
     );
 
+    // The local client count is its own gauge, not derived from the GeoIP
+    // buckets: one authenticated client on this node, in the default server.
+    let local_node = server.server.get_clients().local_node_id();
+    // The gauge must report the very counter the UDP ping answers with in
+    // `Local` scope (and `max_users` is enforced against), not a parallel count.
+    let ping_counter = server
+        .server
+        .get_clients()
+        .local_authenticated_client_count_in_server(crate::types::DEFAULT_SERVER_ID);
+    assert_eq!(ping_counter, 1, "one authenticated client is connected");
+    let local_clients = format!(
+        "shitspeak_local_authenticated_clients{{node=\"{local_node}\",server_id=\"{}\"}} {ping_counter}",
+        crate::types::DEFAULT_SERVER_ID
+    );
+    assert!(
+        text.lines().any(|line| line.trim_end() == local_clients),
+        "local client gauge missing or not 1 (wanted `{local_clients}`):
+{text}"
+    );
+
     // The same series must reach remote write, not just the text endpoint.
     let bodies = source
         .prometheus_remote_write_requests(500, &HashMap::new())
@@ -195,6 +215,12 @@ async fn a_udp_client_reaches_the_scrape_with_its_link_attribution() {
         .iter()
         .map(|body| String::from_utf8_lossy(&decode_snappy_literals(body)).into_owned())
         .collect::<Vec<_>>();
+    assert!(
+        decoded
+            .iter()
+            .any(|body| body.contains("shitspeak_local_authenticated_clients")),
+        "the local client gauge never reached remote write"
+    );
     assert!(
         decoded.iter().any(|body| {
             body.contains("shitspeak_client_udp_packets_total")

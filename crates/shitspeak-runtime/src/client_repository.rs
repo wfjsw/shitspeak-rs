@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use tokio::net::TcpStream;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
@@ -90,7 +91,10 @@ type PromiscuousClientSnapshot = HashMap<String, Arc<[Arc<Box<Client>>]>>;
 #[derive(Default)]
 struct AuthenticatedClientCounts {
     by_server: ParkingRwLock<HashMap<String, Arc<AtomicU64>>>,
-    local_by_server: ParkingRwLock<HashMap<String, Arc<AtomicU64>>>,
+    /// Counters for clients owned by this node. Read on every authentication,
+    /// every UDP ping and every metrics scrape, so reads are lock-free; the map
+    /// is copied only when a virtual server id is seen for the first time.
+    local_by_server: ArcSwap<HashMap<String, Arc<AtomicU64>>>,
 }
 
 impl AuthenticatedClientCounts {
@@ -115,23 +119,45 @@ impl AuthenticatedClientCounts {
     }
 
     fn local_counter(&self, server_id: &str) -> Arc<AtomicU64> {
-        if let Some(counter) = self.local_by_server.read().get(server_id).cloned() {
-            return counter;
+        if let Some(counter) = self.local_by_server.load().get(server_id) {
+            return Arc::clone(counter);
         }
-        Arc::clone(
-            self.local_by_server
-                .write()
-                .entry(server_id.to_owned())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
-        )
+        // First sight of this virtual server. `rcu` may rerun the closure when
+        // another thread publishes first; a rerun then finds that thread's
+        // counter already in the map and returns it, so every caller ends up
+        // holding the one counter that is in the published map.
+        let mut counter = None;
+        self.local_by_server.rcu(|servers| {
+            let mut next = HashMap::clone(servers);
+            counter = Some(Arc::clone(
+                next.entry(server_id.to_owned())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+            ));
+            next
+        });
+        counter.expect("rcu closure ran at least once")
     }
 
     fn local_get(&self, server_id: &str) -> u64 {
         self.local_by_server
-            .read()
+            .load()
             .get(server_id)
             .map(|counter| counter.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Every virtual server this node has counted a local client in, with the
+    /// current count, sorted by server id so scrape output stays stable. A
+    /// server that has emptied keeps its entry at zero.
+    fn local_snapshot(&self) -> Vec<(String, u64)> {
+        let mut counts = self
+            .local_by_server
+            .load()
+            .iter()
+            .map(|(server_id, counter)| (server_id.clone(), counter.load(Ordering::Acquire)))
+            .collect::<Vec<_>>();
+        counts.sort();
+        counts
     }
 
     fn try_local_increment_below(&self, server_id: &str, limit: u64) -> bool {
@@ -810,6 +836,13 @@ impl ClientRepository {
     /// in a virtual server without materializing a repository snapshot.
     pub fn local_authenticated_client_count_in_server(&self, server_id: &str) -> u64 {
         self.authenticated_client_counts.local_get(server_id)
+    }
+
+    /// Return the authenticated, visible clients owned by this node for every
+    /// virtual server it has served, sorted by server id. Same counter that
+    /// enforces `max_users`, so no repository snapshot is materialized.
+    pub fn local_authenticated_client_counts(&self) -> Vec<(String, u64)> {
+        self.authenticated_client_counts.local_snapshot()
     }
 
     fn apply_authenticated_client_count_change(
@@ -3719,6 +3752,47 @@ impl ClientRepository {
 
 #[cfg(test)]
 mod tests {
+    /// The first sighting of a virtual server id races: every thread must end
+    /// up incrementing the single counter that the published map holds, or
+    /// `max_users`, the UDP ping and the metrics gauge would each see only a
+    /// fraction of the clients.
+    #[test]
+    fn local_counter_creation_race_shares_one_counter_per_server() {
+        use std::sync::Arc;
+
+        const THREADS: u64 = 16;
+        const PER_THREAD: u64 = 500;
+        let counts = Arc::new(super::AuthenticatedClientCounts::default());
+        let handles = (0..THREADS)
+            .map(|_| {
+                let counts = Arc::clone(&counts);
+                std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        counts.local_increment("default");
+                        counts.local_increment("other");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("counter thread");
+        }
+
+        assert_eq!(counts.local_get("default"), THREADS * PER_THREAD);
+        assert_eq!(counts.local_get("other"), THREADS * PER_THREAD);
+        assert_eq!(counts.local_get("never-seen"), 0);
+        assert_eq!(
+            counts.local_snapshot(),
+            vec![
+                ("default".to_owned(), THREADS * PER_THREAD),
+                ("other".to_owned(), THREADS * PER_THREAD),
+            ]
+        );
+        // Remote-projected counts never leak into the local counters.
+        counts.increment("default");
+        assert_eq!(counts.local_get("default"), THREADS * PER_THREAD);
+    }
+
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,

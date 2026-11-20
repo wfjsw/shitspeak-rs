@@ -693,159 +693,6 @@
         "overrides": [
           {
             "matcher": {
-              "id": "byRegexp",
-              "options": "^(chosen_route_cost|chosen_transport_cost|best_candidate_cost)$"
-            },
-            "properties": [
-              {
-                "id": "decimals",
-                "value": 3
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "candidate_routes"
-            },
-            "properties": [
-              {
-                "id": "decimals",
-                "value": 0
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 24,
-        "x": 0,
-        "y": 35
-      },
-      "id": 69,
-      "options": {
-        "cellHeight": "sm",
-        "showHeader": true
-      },
-      "pluginVersion": "12.4.4",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
-          "format": "table",
-          "instant": true,
-          "range": false,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
-          "format": "table",
-          "instant": true,
-          "range": false,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "label_join(count by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
-          "format": "table",
-          "instant": true,
-          "range": false,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "label_join(min by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
-          "format": "table",
-          "instant": true,
-          "range": false,
-          "refId": "D"
-        }
-      ],
-      "title": "Conversational Best-Effort Routing Decisions",
-      "transformations": [
-        {
-          "id": "joinByField",
-          "options": {
-            "byField": "decision_id",
-            "mode": "outerTabular"
-          }
-        },
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "decision_id": true,
-              "metric": true,
-              "level": true,
-              "target": true
-            },
-            "renameByName": {
-              "Value #A": "chosen_route_cost",
-              "Value #B": "chosen_transport_cost",
-              "Value #C": "candidate_routes",
-              "Value #D": "best_candidate_cost",
-              "dst": "destination",
-              "next_hop": "chosen_next_hop"
-            }
-          }
-        }
-      ],
-      "type": "table"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "footer": {
-              "reducers": []
-            },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
               "id": "byName",
               "options": "rtt_ms"
             },
@@ -1650,10 +1497,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_unmatched_probe_pongs{job=~\"$job\"})",
-          "range": false,
-          "refId": "O",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "O"
         }
       ],
       "title": "Direct Metrics",
@@ -1835,6 +1682,159 @@
               "Value #A": "bytes",
               "Value #B": "packets",
               "Value #C": "avg_bps"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(chosen_route_cost|chosen_transport_cost|best_candidate_cost)$"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "candidate_routes"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 69,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(count by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(min by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "D"
+        }
+      ],
+      "title": "Conversational Best-Effort Routing Decisions",
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "decision_id",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "decision_id": true,
+              "level": true,
+              "metric": true,
+              "target": true
+            },
+            "renameByName": {
+              "Value #A": "chosen_route_cost",
+              "Value #B": "chosen_transport_cost",
+              "Value #C": "candidate_routes",
+              "Value #D": "best_candidate_cost",
+              "dst": "destination",
+              "next_hop": "chosen_next_hop"
             }
           }
         }
@@ -4038,7 +4038,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 118
+        "y": 112
       },
       "id": 34,
       "panels": [],
@@ -4074,7 +4074,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 119
+        "y": 113
       },
       "id": 35,
       "options": {
@@ -4140,7 +4140,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 119
+        "y": 113
       },
       "id": 36,
       "options": {
@@ -4206,7 +4206,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 119
+        "y": 113
       },
       "id": 37,
       "options": {
@@ -4272,7 +4272,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 119
+        "y": 113
       },
       "id": 38,
       "options": {
@@ -4367,7 +4367,7 @@
               }
             ]
           },
-          "unit": "us"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -4375,7 +4375,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 123
+        "y": 117
       },
       "id": 39,
       "options": {
@@ -4476,7 +4476,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 123
+        "y": 117
       },
       "id": 40,
       "options": {
@@ -4577,7 +4577,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 131
+        "y": 125
       },
       "id": 41,
       "options": {
@@ -4678,7 +4678,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 131
+        "y": 125
       },
       "id": 42,
       "options": {
@@ -4801,7 +4801,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 139
+        "y": 133
       },
       "id": 43,
       "options": {
@@ -4874,7 +4874,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 139
+        "y": 133
       },
       "id": 44,
       "options": {
@@ -4890,10 +4890,10 @@
           },
           "editorMode": "code",
           "expr": "max by (transport, state) (shitspeak_s2s_kcp_runtime_state{job=~\"$job\"})",
-          "range": false,
-          "refId": "A",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "A"
         },
         {
           "datasource": {
@@ -4902,10 +4902,10 @@
           },
           "editorMode": "code",
           "expr": "max by (transport, metric) (shitspeak_s2s_kcp_runtime_window{job=~\"$job\"})",
-          "range": false,
-          "refId": "B",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "B"
         },
         {
           "datasource": {
@@ -4914,10 +4914,10 @@
           },
           "editorMode": "code",
           "expr": "max by (transport) (shitspeak_s2s_kcp_last_input_age_ms{job=~\"$job\"})",
-          "range": false,
-          "refId": "C",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "C"
         },
         {
           "datasource": {
@@ -4926,10 +4926,10 @@
           },
           "editorMode": "code",
           "expr": "max by (transport) (shitspeak_s2s_kcp_outstanding_no_progress_age_ms{job=~\"$job\"})",
-          "range": false,
-          "refId": "D",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "D"
         }
       ],
       "title": "KCP Runtime",
@@ -4993,7 +4993,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 147
+        "y": 141
       },
       "id": 45,
       "options": {
@@ -5009,10 +5009,10 @@
           },
           "editorMode": "code",
           "expr": "max by (job, source, peer, direction, transport, class, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"outgoing\"})",
-          "range": false,
-          "refId": "A",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "A"
         },
         {
           "datasource": {
@@ -5021,10 +5021,10 @@
           },
           "editorMode": "code",
           "expr": "max by (job, source, peer, direction, transport, class, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"incoming\"})",
-          "range": false,
-          "refId": "B",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "B"
         }
       ],
       "title": "S2S Split Queue Status (bytes)",
@@ -5086,7 +5086,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 147
+        "y": 141
       },
       "id": 46,
       "options": {
@@ -5102,10 +5102,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_conflict{job=~\"$job\"}) > 0",
-          "range": false,
-          "refId": "A",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "A"
         },
         {
           "datasource": {
@@ -5114,10 +5114,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, node, reason) (shitspeak_s2s_node_quarantined{job=~\"$job\"}) > 0",
-          "range": false,
-          "refId": "B",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "B"
         },
         {
           "datasource": {
@@ -5126,10 +5126,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_observed_epochs{job=~\"$job\"}) and on (source, node) ((max by (source, node) (shitspeak_s2s_duplicate_node_conflict{job=~\"$job\"}) > 0) or (max by (source, node) (shitspeak_s2s_node_quarantined{job=~\"$job\"}) > 0))",
-          "range": false,
-          "refId": "C",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "C"
         },
         {
           "datasource": {
@@ -5138,10 +5138,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_age_ms{job=~\"$job\"}) > 0",
-          "range": false,
-          "refId": "D",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "D"
         },
         {
           "datasource": {
@@ -5150,10 +5150,10 @@
           },
           "editorMode": "code",
           "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_remaining_ms{job=~\"$job\"}) > 0",
-          "range": false,
-          "refId": "E",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "E"
         },
         {
           "datasource": {
@@ -5162,10 +5162,10 @@
           },
           "editorMode": "code",
           "expr": "sum by (source, node) (rate(shitspeak_s2s_duplicate_node_conflicts_total{job=~\"$job\"}[$__rate_interval])) > 0",
-          "range": false,
-          "refId": "F",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "F"
         },
         {
           "datasource": {
@@ -5174,10 +5174,10 @@
           },
           "editorMode": "code",
           "expr": "sum by (source, node, kind) (rate(shitspeak_s2s_duplicate_node_dropped_messages_total{job=~\"$job\"}[$__rate_interval])) > 0",
-          "range": false,
-          "refId": "G",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "G"
         },
         {
           "datasource": {
@@ -5186,10 +5186,10 @@
           },
           "editorMode": "code",
           "expr": "sum by (node) (rate(shitspeak_s2s_duplicate_node_startup_failures_total{job=~\"$job\"}[$__rate_interval])) > 0",
-          "range": false,
-          "refId": "H",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "H"
         }
       ],
       "title": "Active Duplicate Node Signals",
@@ -5225,7 +5225,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 155
+        "y": 149
       },
       "id": 47,
       "panels": [],
@@ -5261,7 +5261,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 156
+        "y": 150
       },
       "id": 48,
       "options": {
@@ -5327,7 +5327,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 156
+        "y": 150
       },
       "id": 49,
       "options": {
@@ -5393,7 +5393,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 156
+        "y": 150
       },
       "id": 50,
       "options": {
@@ -5459,7 +5459,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 156
+        "y": 150
       },
       "id": 51,
       "options": {
@@ -5562,7 +5562,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 160
+        "y": 154
       },
       "id": 52,
       "options": {
@@ -5685,7 +5685,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 160
+        "y": 154
       },
       "id": 53,
       "options": {
@@ -5778,7 +5778,7 @@
               }
             ]
           },
-          "unit": "us"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -5786,7 +5786,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 168
+        "y": 162
       },
       "id": 54,
       "options": {
@@ -5887,7 +5887,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 168
+        "y": 162
       },
       "id": 55,
       "options": {
@@ -5980,15 +5980,32 @@
               }
             ]
           },
-          "unit": "us"
+          "unit": "\u00b5s"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 176
+        "y": 170
       },
       "id": 56,
       "options": {
@@ -6040,7 +6057,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 184
+        "y": 178
       },
       "id": 57,
       "panels": [],
@@ -6113,7 +6130,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 185
+        "y": 179
       },
       "id": 58,
       "options": {
@@ -6225,7 +6242,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 185
+        "y": 179
       },
       "id": 59,
       "options": {
@@ -6283,12 +6300,234 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 187
+      },
+      "id": 79,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\",result=~\"gap_buffered|gap_filled|deadline_flush|buffer_drop|duplicate_or_late\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(shitspeak_s2s_voice_reorder_pending{job=~\"$job\"})",
+          "legendFormat": "pending frames",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "S2S Voice Reorder Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Frames the receiver reorder rejected without delivering (result=\"duplicate_or_late\"), by why and by which copy arrived. delivered_* = already delivered by that copy kind; late_after_release = arrived after the receiver released past it (never heard); already_buffered, repair_without_gap/stream, stale_epoch, untracked as named.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 187
+      },
+      "id": 113,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason, copy) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\",result=\"duplicate_or_late\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}} ({{copy}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "S2S Voice Rejected Frames by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Only active problems are listed. A blocked row means the aggregate voice datagram lane for that source\u2192peer is blocked; the path rows identify whether UDP or QUIC is suspect/blocked. Probe-loss and exclusion rows show the supporting evidence.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 195
+      },
+      "id": 112,
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "lane blocked"
+          }
+        ]
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (source, peer, signal) (rate(shitspeak_s2s_voice_datagram_lane_signal_total{job=~\"$job\",signal=~\"lane_blocked|hard_loss|sink_gap\"}[$__rate_interval])) > 0",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} \u2192 {{peer}} {{signal}}",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_loss_ppm{job=~\"$job\",kind=\"probe\"}) > 0",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} \u2192 {{peer}} {{transport}} probe loss ppm",
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (peer, transport, reason) (rate(shitspeak_s2s_transport_health_exclusions_total{job=~\"$job\"}[$__rate_interval])) > 0",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "peer {{peer}} {{transport}} {{reason}}",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "shitspeak_s2s_datagram_path_health{job=~\"$job\",state=~\"suspect|blocked\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} \u2192 {{peer}} {{path}} {{state}}/{{reason}}",
+          "range": false,
+          "refId": "D"
+        }
+      ],
+      "title": "Voice Datagram Health by Node and Peer",
+      "type": "table"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 201
+        "y": 203
       },
       "id": 60,
       "panels": [],
@@ -6361,7 +6600,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 202
+        "y": 204
       },
       "id": 61,
       "options": {
@@ -6479,7 +6718,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 202
+        "y": 204
       },
       "id": 62,
       "options": {
@@ -6583,7 +6822,7 @@
               }
             ]
           },
-          "unit": "us"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -6591,7 +6830,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 210
+        "y": 212
       },
       "id": 63,
       "options": {
@@ -6692,7 +6931,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 210
+        "y": 212
       },
       "id": 64,
       "options": {
@@ -6793,7 +7032,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 218
+        "y": 220
       },
       "id": 65,
       "options": {
@@ -6916,7 +7155,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 218
+        "y": 220
       },
       "id": 66,
       "options": {
@@ -7050,7 +7289,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 226
+        "y": 228
       },
       "id": 67,
       "options": {
@@ -7151,7 +7390,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 226
+        "y": 228
       },
       "id": 68,
       "options": {
@@ -7192,7 +7431,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 234
+        "y": 236
       },
       "id": 70,
       "panels": [],
@@ -7228,7 +7467,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 235
+        "y": 237
       },
       "id": 71,
       "options": {
@@ -7294,7 +7533,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 235
+        "y": 237
       },
       "id": 72,
       "options": {
@@ -7360,7 +7599,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 235
+        "y": 237
       },
       "id": 73,
       "options": {
@@ -7426,7 +7665,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 235
+        "y": 237
       },
       "id": 74,
       "options": {
@@ -7491,7 +7730,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 239
+        "y": 241
       },
       "id": 75,
       "options": {
@@ -7554,7 +7793,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 239
+        "y": 241
       },
       "id": 76,
       "options": {
@@ -7617,7 +7856,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 247
+        "y": 249
       },
       "id": 77,
       "options": {
@@ -7668,6 +7907,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "description": "v2 wall-clock distribution deadlines (deadline_translation/deadline_expiry/clock_offset_fallback) are retired under v3 hop-local TTL expiry: every tree is installed with hop_ttl=80ms so those events are never emitted (dead code, kept only for unit coverage). Ref A is a v2 canary that only fires if hop_ttl is ever configured to 0; refs B/C are the live v3 expiry/deadline signals: send-deadline expiries per peer and reorder deadline wakes per result.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -7689,12 +7929,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
-        "y": 255
+        "y": 257
       },
       "id": 78,
-      "description": "v2 wall-clock distribution deadlines (deadline_translation/deadline_expiry/clock_offset_fallback) are retired under v3 hop-local TTL expiry: every tree is installed with hop_ttl=80ms so those events are never emitted (dead code, kept only for unit coverage). Ref A is a v2 canary that only fires if hop_ttl is ever configured to 0; refs B/C are the live v3 expiry/deadline signals: send-deadline expiries per peer and reorder deadline wakes per result.",
       "options": {
         "legend": {
           "calcs": [
@@ -7769,145 +8008,7 @@
               }
             ]
           },
-          "unit": "pps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 255
-      },
-      "id": 79,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.4.4",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (result) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\",result=~\"gap_buffered|gap_filled|deadline_flush|buffer_drop|duplicate_or_late\"}[$__rate_interval]))",
-          "legendFormat": "{{result}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum(shitspeak_s2s_voice_reorder_pending{job=~\"$job\"})",
-          "legendFormat": "pending frames",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "S2S Voice Reorder Outcomes",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          },
-          "unit": "pps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 263
-      },
-      "id": 113,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.4.4",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (reason, copy) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\",result=\"duplicate_or_late\"}[$__rate_interval]))",
-          "legendFormat": "{{reason}} ({{copy}})",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "S2S Voice Rejected Frames by Reason",
-      "type": "timeseries",
-      "description": "Frames the receiver reorder rejected without delivering (result=\"duplicate_or_late\"), by why and by which copy arrived. delivered_* = already delivered by that copy kind; late_after_release = arrived after the receiver released past it (never heard); already_buffered, repair_without_gap/stream, stale_epoch, untracked as named."
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          },
-          "unit": "us"
+          "unit": "\u00b5s"
         },
         "overrides": []
       },
@@ -7915,7 +8016,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 271
+        "y": 265
       },
       "id": 82,
       "options": {
@@ -7989,7 +8090,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 271
+        "y": 265
       },
       "id": 83,
       "options": {
@@ -8052,7 +8153,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 279
+        "y": 273
       },
       "id": 84,
       "options": {
@@ -8115,7 +8216,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 279
+        "y": 273
       },
       "id": 85,
       "options": {
@@ -8175,7 +8276,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 287
+        "y": 281
       },
       "id": 86,
       "options": {
@@ -8218,7 +8319,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 291
+        "y": 285
       },
       "id": 87,
       "panels": [],
@@ -8257,7 +8358,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 292
+        "y": 286
       },
       "id": 88,
       "options": {
@@ -8320,7 +8421,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 292
+        "y": 286
       },
       "id": 89,
       "options": {
@@ -8394,7 +8495,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 300
+        "y": 294
       },
       "id": 90,
       "options": {
@@ -8468,7 +8569,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 300
+        "y": 294
       },
       "id": 91,
       "options": {
@@ -8539,7 +8640,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 300
+        "y": 294
       },
       "id": 92,
       "options": {
@@ -8610,7 +8711,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 308
+        "y": 302
       },
       "id": 93,
       "options": {
@@ -8677,7 +8778,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 308
+        "y": 302
       },
       "id": 94,
       "options": {
@@ -8718,7 +8819,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 316
+        "y": 310
       },
       "id": 95,
       "panels": [],
@@ -8757,7 +8858,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 317
+        "y": 311
       },
       "id": 96,
       "options": {
@@ -8835,7 +8936,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 317
+        "y": 311
       },
       "id": 97,
       "options": {
@@ -8924,7 +9025,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 325
+        "y": 319
       },
       "id": 101,
       "options": {
@@ -9002,7 +9103,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 325
+        "y": 319
       },
       "id": 102,
       "options": {
@@ -9080,7 +9181,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 333
+        "y": 327
       },
       "id": 103,
       "options": {
@@ -9143,7 +9244,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 333
+        "y": 327
       },
       "id": 104,
       "options": {
@@ -9206,7 +9307,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 341
+        "y": 335
       },
       "id": 105,
       "options": {
@@ -9280,7 +9381,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 341
+        "y": 335
       },
       "id": 106,
       "options": {
@@ -9363,9 +9464,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 349
+        "w": 24,
+        "x": 0,
+        "y": 343
       },
       "id": 111,
       "options": {
@@ -9419,7 +9520,7 @@
           "refId": "C"
         }
       ],
-      "title": "Voice Transition Copy Sheds/s by reason",
+      "title": "Voice Transition Copy Sheds/s by Reason",
       "type": "timeseries"
     },
     {
@@ -9450,7 +9551,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 349
+        "y": 351
       },
       "id": 109,
       "options": {
@@ -9513,7 +9614,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 349
+        "y": 351
       },
       "id": 110,
       "options": {
@@ -9580,7 +9681,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 357
+        "y": 359
       },
       "id": 107,
       "options": {
@@ -9647,7 +9748,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 357
+        "y": 359
       },
       "id": 108,
       "options": {
@@ -9683,63 +9784,2005 @@
       "type": "timeseries"
     },
     {
-      "id": 112,
-      "title": "Voice Datagram Health by Node and Peer",
-      "type": "table",
+      "collapsed": false,
       "gridPos": {
-        "h": 8,
+        "h": 1,
         "w": 24,
         "x": 0,
-        "y": 193
+        "y": 367
       },
+      "id": 114,
+      "panels": [],
+      "title": "Client UDP Link and GeoIP",
+      "type": "row"
+    },
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "description": "Authenticated clients owned by each node, summed over every node. Unlike Total Clients (the replicated repository size) this counts each client once, on the node it is connected to.",
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
         "overrides": []
       },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 368
+      },
+      "id": 115,
       "options": {
-        "showHeader": true,
-        "sortBy": [
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum (shitspeak_local_authenticated_clients{job=~\"$job\"})",
+          "instant": false,
+          "legendFormat": "clients",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Clients (Sum of Nodes)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Cluster-wide share of client\u2192server UDP packets that never arrived, over the rate interval.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "orange",
+                "value": 0.03
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 368
+      },
+      "id": 116,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "instant": false,
+          "legendFormat": "uplink loss",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Uplink Loss",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Cluster-wide share of server\u2192client UDP packets that never arrived, as the clients report it in their own pings.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "orange",
+                "value": 0.03
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 368
+      },
+      "id": 117,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "instant": false,
+          "legendFormat": "downlink loss",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Downlink Loss (Reported)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "OCB2 decryptor nonce-window resynchronisations across all clients and both directions; the key is unchanged, only the nonce is reset.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 368
+      },
+      "id": 118,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum (rate(shitspeak_client_udp_packets_total{job=~\"$job\",result=\"resync\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "resyncs",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Nonce Resyncs/s",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Connected clients by GeoIP city, marker size = client count. Clients without coordinates (private ranges, GeoIP off, country-only records) are not on the map; see the city table.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "dark-green",
+            "mode": "fixed"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 0,
+        "y": 372
+      },
+      "id": 119,
+      "options": {
+        "basemap": {
+          "config": {},
+          "name": "Basemap",
+          "type": "osm-standard"
+        },
+        "controls": {
+          "mouseWheelZoom": true,
+          "showAttribution": true,
+          "showDebug": false,
+          "showMeasure": false,
+          "showScale": false,
+          "showZoom": true
+        },
+        "layers": [
           {
-            "displayName": "lane blocked",
-            "desc": true
+            "config": {
+              "showLegend": true,
+              "style": {
+                "color": {
+                  "fixed": "dark-green"
+                },
+                "opacity": 0.6,
+                "rotation": {
+                  "fixed": 0,
+                  "max": 360,
+                  "min": -360,
+                  "mode": "mod"
+                },
+                "size": {
+                  "field": "Value",
+                  "fixed": 5,
+                  "max": 24,
+                  "min": 4
+                },
+                "symbol": {
+                  "fixed": "img/icons/marker/circle.svg",
+                  "mode": "fixed"
+                },
+                "symbolAlign": {
+                  "horizontal": "center",
+                  "vertical": "center"
+                },
+                "textConfig": {
+                  "fontSize": 12,
+                  "offsetX": 0,
+                  "offsetY": 0,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                }
+              }
+            },
+            "location": {
+              "latitude": "lat",
+              "longitude": "lon",
+              "mode": "coords"
+            },
+            "name": "Clients",
+            "tooltip": true,
+            "type": "markers"
+          }
+        ],
+        "tooltip": {
+          "mode": "details"
+        },
+        "view": {
+          "allLayers": true,
+          "id": "zero",
+          "lat": 20,
+          "lon": 10,
+          "zoom": 1.4
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region, city, lat, lon) (shitspeak_clients_by_city{job=~\"$job\",lat!=\"\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Map",
+      "transformations": [
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "number",
+                "targetField": "lat"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "lon"
+              }
+            ],
+            "fields": {}
+          }
+        }
+      ],
+      "type": "geomap"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of uplink packets lost per GeoIP city over the rate interval, marker colour = loss. A red city among green neighbours is a city-level route problem.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "dark-green",
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "orange",
+                "value": 0.03
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 12,
+        "y": 372
+      },
+      "id": 120,
+      "options": {
+        "basemap": {
+          "config": {},
+          "name": "Basemap",
+          "type": "osm-standard"
+        },
+        "controls": {
+          "mouseWheelZoom": true,
+          "showAttribution": true,
+          "showDebug": false,
+          "showMeasure": false,
+          "showScale": false,
+          "showZoom": true
+        },
+        "layers": [
+          {
+            "config": {
+              "showLegend": true,
+              "style": {
+                "color": {
+                  "field": "Value",
+                  "fixed": "dark-green"
+                },
+                "opacity": 0.6,
+                "rotation": {
+                  "fixed": 0,
+                  "max": 360,
+                  "min": -360,
+                  "mode": "mod"
+                },
+                "size": {
+                  "fixed": 8,
+                  "max": 15,
+                  "min": 2
+                },
+                "symbol": {
+                  "fixed": "img/icons/marker/circle.svg",
+                  "mode": "fixed"
+                },
+                "symbolAlign": {
+                  "horizontal": "center",
+                  "vertical": "center"
+                },
+                "textConfig": {
+                  "fontSize": 12,
+                  "offsetX": 0,
+                  "offsetY": 0,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                }
+              }
+            },
+            "location": {
+              "latitude": "lat",
+              "longitude": "lon",
+              "mode": "coords"
+            },
+            "name": "Uplink loss",
+            "tooltip": true,
+            "type": "markers"
+          }
+        ],
+        "tooltip": {
+          "mode": "details"
+        },
+        "view": {
+          "allLayers": true,
+          "id": "zero",
+          "lat": 20,
+          "lon": 10,
+          "zoom": 1.4
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\",lat!=\"\"}[$__rate_interval])) / (sum by (region, city, lat, lon) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\",lat!=\"\"}[$__rate_interval])) > 0)",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Uplink Loss Map",
+      "transformations": [
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "number",
+                "targetField": "lat"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "lon"
+              }
+            ],
+            "fields": {}
+          }
+        }
+      ],
+      "type": "geomap"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Authenticated clients connected to each node (the count max_users is enforced against), stacked so the top edge is the cluster total.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 384
+      },
+      "id": 121,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (shitspeak_local_authenticated_clients{job=~\"$job\"})",
+          "legendFormat": "node {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Local Clients by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Connected clients per GeoIP country (ISO 3166-1 alpha-2). `unknown` covers private ranges and a disabled GeoIP database.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 384
+      },
+      "id": 122,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region) (shitspeak_clients_by_region{job=~\"$job\"})",
+          "legendFormat": "{{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Clients by Region",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Connected clients for the 15 largest GeoIP cities over time (cities without a GeoIP answer are excluded). Each row is one city.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 392
+      },
+      "id": 123,
+      "options": {
+        "colWidth": 0.9,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "rowHeight": 0.9,
+        "showValue": "auto",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(15, sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\",city!=\"unknown\"}))",
+          "legendFormat": "{{city}}, {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Density by City",
+      "type": "status-history"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Clients and uplink/downlink loss per GeoIP city (`unknown` collects clients GeoIP could not place). Loss is over the rate interval.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Uplink loss"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.01
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.03
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.05
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Downlink loss (reported)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.01
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.03
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.05
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
           }
         ]
       },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 400
+      },
+      "id": 124,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "Clients"
+          }
+        ]
+      },
+      "pluginVersion": "12.4.4",
       "targets": [
         {
-          "refId": "A",
-          "expr": "sum by (source, peer, signal) (rate(shitspeak_s2s_voice_datagram_lane_signal_total{job=~\"$job\",signal=~\"lane_blocked|hard_loss|sink_gap\"}[$__rate_interval])) > 0",
-          "legendFormat": "{{source}} \u2192 {{peer}} {{signal}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\"})",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "A"
         },
         {
-          "refId": "B",
-          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_loss_ppm{job=~\"$job\",kind=\"probe\"}) > 0",
-          "legendFormat": "{{source}} \u2192 {{peer}} {{transport}} probe loss ppm",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "B"
         },
         {
-          "refId": "C",
-          "expr": "sum by (peer, transport, reason) (rate(shitspeak_s2s_transport_health_exclusions_total{job=~\"$job\"}[$__rate_interval])) > 0",
-          "legendFormat": "peer {{peer}} {{transport}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
-          "instant": true
-        },
-        {
-          "refId": "D",
-          "expr": "shitspeak_s2s_datagram_path_health{job=~\"$job\",state=~\"suspect|blocked\"}",
-          "legendFormat": "{{source}} \u2192 {{peer}} {{path}} {{state}}/{{reason}}",
-          "format": "table",
-          "instant": true
+          "instant": true,
+          "range": false,
+          "refId": "C"
         }
       ],
-      "description": "Only active problems are listed. A blocked row means the aggregate voice datagram lane for that source\u2192peer is blocked; the path rows identify whether UDP or QUIC is suspect/blocked. Probe-loss and exclusion rows show the supporting evidence."
+      "title": "Clients and Loss by City",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "city": 1,
+              "region": 0
+            },
+            "renameByName": {
+              "Value #A": "Clients",
+              "Value #B": "Uplink loss",
+              "Value #C": "Downlink loss (reported)",
+              "city": "City",
+              "region": "Region"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of the sender\u2019s UDP packets that never arrived (lost / good+late+lost), from the OCB2 nonce window. Solid = uplink (measured on the server); dashed = downlink (reported by the clients in their pings). Counters are per client session, so rates are summed by the split shown; a lost packet that is later reclassified as late can briefly inflate the ratio.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 409
+      },
+      "id": 125,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "uplink node {{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (node) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "downlink node {{node}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Loss by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of the sender\u2019s UDP packets that never arrived (lost / good+late+lost), from the OCB2 nonce window. Solid = uplink (measured on the server); dashed = downlink (reported by the clients in their pings). Counters are per client session, so rates are summed by the split shown; a lost packet that is later reclassified as late can briefly inflate the ratio.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 409
+      },
+      "id": 126,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "uplink {{entrypoint}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (entrypoint) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "downlink {{entrypoint}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Loss by Entrypoint",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of the sender\u2019s UDP packets that never arrived (lost / good+late+lost), from the OCB2 nonce window. Solid = uplink (measured on the server); dashed = downlink (reported by the clients in their pings). Counters are per client session, so rates are summed by the split shown; a lost packet that is later reclassified as late can briefly inflate the ratio.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 417
+      },
+      "id": 127,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "uplink {{region}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "downlink {{region}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Loss by Region",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of the sender\u2019s UDP packets that never arrived (lost / good+late+lost), from the OCB2 nonce window. Solid = uplink (measured on the server); dashed = downlink (reported by the clients in their pings). Counters are per client session, so rates are summed by the split shown; a lost packet that is later reclassified as late can briefly inflate the ratio. Shows the 10 worst groups with at least 1 packet/s.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 417
+      },
+      "id": 128,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "legendFormat": "uplink AS{{asn}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (asn) (sum by (asn) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "legendFormat": "downlink AS{{asn}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Loss by ASN (Worst 10)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of the sender\u2019s UDP packets that never arrived (lost / good+late+lost), from the OCB2 nonce window. Solid = uplink (measured on the server); dashed = downlink (reported by the clients in their pings). Counters are per client session, so rates are summed by the split shown; a lost packet that is later reclassified as late can briefly inflate the ratio. Shows the 10 worst groups with at least 1 packet/s.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 425
+      },
+      "id": 129,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "legendFormat": "uplink {{subnet}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)) and on (subnet) (sum by (subnet) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 1))",
+          "legendFormat": "downlink {{subnet}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Loss by Subnet (Worst 10)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of packets that arrived late (filled an earlier gap) rather than never: late / (good+late+lost). High late with low loss points at reordering, not loss. Solid = uplink, dashed = downlink (reported).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^downlink/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 425
+      },
+      "id": 130,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "uplink {{region}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=\"late\"}[$__rate_interval])) / (sum by (region) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "legendFormat": "downlink {{region}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client UDP Reordering by Region",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The 15 client links with the highest lifetime loss ratio (per direction), among links that have carried at least 500 packets. Compare with the region/ASN/subnet panels to tell one bad client from a bad path. Sessions are re-minted on reconnect.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Loss"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.01
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.03
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.05
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 433
+      },
+      "id": 131,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "Loss"
+          }
+        ]
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(15, shitspeak_client_udp_packet_loss_ratio{job=~\"$job\"} and on (node, server_id, session, direction) (sum by (node, server_id, session, direction) (shitspeak_client_udp_packets_total{job=~\"$job\",result=~\"good|late|lost\"}) >= 500))",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Worst Client UDP Links",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "lat": true,
+              "lon": true
+            },
+            "indexByName": {
+              "Value": 9,
+              "asn": 6,
+              "city": 5,
+              "direction": 0,
+              "entrypoint": 8,
+              "node": 1,
+              "region": 4,
+              "server_id": 2,
+              "session": 3,
+              "subnet": 7
+            },
+            "renameByName": {
+              "Value": "Loss"
+            }
+          }
+        }
+      ],
+      "type": "table"
     }
   ],
   "preload": false,
@@ -9753,10 +11796,7 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "text": "Prometheus",
-          "value": "aeoq1l20dsa9sc"
-        },
+        "current": {},
         "includeAll": false,
         "label": "Metrics source",
         "name": "datasource",

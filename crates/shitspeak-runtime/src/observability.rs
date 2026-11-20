@@ -339,18 +339,32 @@ impl ServerMetricsSource {
         samples_with_node_label(client_projection_samples(), self.clients.local_node_id())
     }
 
+    /// Authenticated clients owned by this node, per virtual server.
+    ///
+    /// Read from the counter that enforces `max_users`, so it needs neither a
+    /// repository snapshot nor GeoIP and keeps reporting while the sampler
+    /// below has nothing to say (no server handle, GeoIP off).
+    fn local_client_samples(&self) -> Vec<PrometheusSample> {
+        local_client_samples_from_counts(
+            self.clients.local_node_id(),
+            self.clients.local_authenticated_client_counts(),
+        )
+    }
+
     /// One pass over the local clients that yields the per-client UDP link
     /// series plus the region and city distributions the heatmaps read.
     ///
     /// Only locals are sampled: a projected remote client has no crypt state
-    /// here and its owning node exports the same link. Buckets are keyed and
-    /// sorted so scrape output stays stable between calls.
+    /// here and its owning node exports the same link. The snapshot is taken
+    /// from the local register alone, so a scrape never touches (or clones the
+    /// clients of) any remote node's register. Buckets are keyed and sorted so
+    /// scrape output stays stable between calls.
     async fn client_link_samples(&self) -> ClientLinkSamples {
         let Some(server) = self.server.upgrade() else {
             return ClientLinkSamples::default();
         };
         let local_node_id = self.clients.local_node_id();
-        let (clients, _) = self.clients.snapshot_with_versions().await;
+        let clients = self.clients.get_local_clients().await;
         let mut samples = ClientLinkSamples {
             udp: Vec::with_capacity(clients.len() * 10),
             ..ClientLinkSamples::default()
@@ -359,9 +373,6 @@ impl ServerMetricsSource {
         let mut regions: HashMap<(String, String), usize> = HashMap::new();
         let mut cities: HashMap<CityKey, usize> = HashMap::new();
         for (index, client) in clients.iter().enumerate() {
-            if client.get_node_id() != local_node_id {
-                continue;
-            }
             // Nothing in the GeoIP path awaits, so without this the whole
             // pass would hold one runtime worker for the duration of a scrape.
             if index % GEOIP_YIELD_EVERY == 0 {
@@ -449,6 +460,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
         render_voice_metrics_into(&mut body, &self.voice_samples());
         render_client_projection_metrics_into(&mut body, &self.client_projection_samples());
+        render_local_client_metrics_into(&mut body, &self.local_client_samples());
         let client_link = self.client_link_samples().await;
         render_client_udp_metrics_into(&mut body, &client_link.udp);
         let mut geo = client_link.city;
@@ -468,6 +480,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         samples.extend(self.consensus_samples().await);
         samples.extend(self.voice_samples());
         samples.extend(self.client_projection_samples());
+        samples.extend(self.local_client_samples());
         let client_link = self.client_link_samples().await;
         samples.extend(client_link.udp);
         samples.extend(client_link.city);
@@ -857,6 +870,35 @@ fn render_client_udp_metrics_into(out: &mut String, samples: &[PrometheusSample]
 // Cluster-wide view: drop node/server_id from the selectors and aggregate with
 // sum by (region, city, lat, lon).
 // Search with: rg "CLIENT_GEO_HEATMAP_PROMQL"
+fn local_client_samples_from_counts(
+    node_id: u16,
+    counts: Vec<(String, u64)>,
+) -> Vec<PrometheusSample> {
+    counts
+        .into_iter()
+        .map(|(server_id, count)| {
+            PrometheusSample::new(
+                LOCAL_CLIENTS_METRIC,
+                vec![
+                    ("node".to_owned(), node_id.to_string()),
+                    ("server_id".to_owned(), server_id),
+                ],
+                count as f64,
+            )
+        })
+        .collect()
+}
+
+fn render_local_client_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    render_prometheus_header(out, LOCAL_CLIENTS_METRIC, LOCAL_CLIENTS_HELP, "gauge");
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+const LOCAL_CLIENTS_METRIC: &str = "shitspeak_local_authenticated_clients";
+const LOCAL_CLIENTS_HELP: &str = "Authenticated, visible clients owned by this node per virtual server (the count `max_users` is enforced against). Unlike `shitspeak_consensus_clients_total` it excludes clients projected from other nodes; sum over `node` for the cluster total.";
+
 fn render_client_geo_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
     for (name, help, kind) in CLIENT_GEO_METRIC_HEADERS {
         render_prometheus_header(out, name, help, kind);
@@ -1968,6 +2010,32 @@ mod tests {
         assert!(rendered.contains(
             "shitspeak_clients_by_city{node=\"12\",server_id=\"default\",region=\"DE\",city=\"Frankfurt am Main\",lat=\"50.1109\",lon=\"8.6821\"} 3"
         ));
+    }
+
+    #[test]
+    fn local_client_metric_is_per_node_and_server_and_keeps_empty_servers() {
+        let samples = local_client_samples_from_counts(
+            12,
+            vec![("default".to_owned(), 3), ("quiet".to_owned(), 0)],
+        );
+        let mut rendered = String::new();
+        render_local_client_metrics_into(&mut rendered, &samples);
+
+        assert!(rendered.contains(
+            "# TYPE shitspeak_local_authenticated_clients gauge
+"
+        ));
+        assert!(rendered.contains("# HELP shitspeak_local_authenticated_clients"));
+        assert!(rendered.contains(
+            "shitspeak_local_authenticated_clients{node=\"12\",server_id=\"default\"} 3"
+        ));
+        // An emptied server must read 0, not vanish, so `sum by (node)` and
+        // alerts on a drop to zero keep a series to evaluate.
+        assert!(
+            rendered.contains(
+                "shitspeak_local_authenticated_clients{node=\"12\",server_id=\"quiet\"} 0"
+            )
+        );
     }
 
     #[test]

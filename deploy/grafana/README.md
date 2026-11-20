@@ -7,7 +7,10 @@ S2S topology metrics.
   tables, build versions, direct metrics, route views, S2S queue status,
   transport and replication internals, S2S voice metrics, versioned
   distribution-tree control and forwarding metrics, native voice internals,
-  packet IO, and a node globe.
+  packet IO, a node globe, and a client UDP link / GeoIP section (per-client
+  uplink and client-reported downlink loss split by node, entrypoint, region,
+  ASN and subnet, local client counts per node, client location maps, and a
+  worst-links table).
 - `provisioning/dashboards/shitspeak-s2s.yaml`: Grafana dashboard provider.
 - `provisioning/datasources/mimir.yaml`: configurable Prometheus/Mimir
   datasource.
