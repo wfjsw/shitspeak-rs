@@ -10644,7 +10644,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Clients and uplink/downlink loss per GeoIP city (`unknown` collects clients GeoIP could not place). Loss is over the rate interval.",
+      "description": "Clients and uplink/downlink loss per node and GeoIP city; each row is one city as seen by one node (Domain = node hostname, Node ID = its numeric id). `unknown` collects clients GeoIP could not place. Loss is over the rate interval.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -10788,7 +10788,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\"})",
+          "expr": "sum by (node, nodename, region, city) (shitspeak_clients_by_city{job=~\"$job\",node=~\"$node\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10800,7 +10800,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node, nodename, region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=\"lost\"}[$__rate_interval])) / (sum by (node, nodename, region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"uplink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10812,7 +10812,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (node, nodename, region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=\"lost\"}[$__rate_interval])) / (sum by (node, nodename, region, city) (rate(shitspeak_client_udp_packets_total{job=~\"$job\",node=~\"$node\",direction=\"downlink\",result=~\"good|late|lost\"}[$__rate_interval])) > 0)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -10832,17 +10832,21 @@
               "Time": true
             },
             "indexByName": {
-              "Value #A": 2,
-              "Value #B": 3,
-              "Value #C": 4,
-              "city": 1,
-              "region": 0
+              "Value #A": 4,
+              "Value #B": 5,
+              "Value #C": 6,
+              "city": 3,
+              "node": 1,
+              "nodename": 0,
+              "region": 2
             },
             "renameByName": {
               "Value #A": "Clients",
               "Value #B": "Uplink loss",
               "Value #C": "Downlink loss (reported)",
               "city": "City",
+              "node": "Node ID",
+              "nodename": "Domain",
               "region": "Region"
             }
           }
@@ -11846,7 +11850,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(shitspeak_local_authenticated_clients{job=~\"$job\"}, node)",
+        "definition": "query_result(label_join(max by (node, nodename) (shitspeak_local_authenticated_clients{job=~\"$job\"}), \"label\", \" - \", \"node\", \"nodename\"))",
         "description": "Filters every panel in the Client UDP Link and GeoIP row to one or more nodes (the node a client is connected to / whose UDP link is measured). All = whole cluster.",
         "includeAll": true,
         "label": "Client node",
@@ -11854,11 +11858,11 @@
         "name": "node",
         "options": [],
         "query": {
-          "query": "label_values(shitspeak_local_authenticated_clients{job=~\"$job\"}, node)",
+          "query": "query_result(label_join(max by (node, nodename) (shitspeak_local_authenticated_clients{job=~\"$job\"}), \"label\", \" - \", \"node\", \"nodename\"))",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,
-        "regex": "",
+        "regex": "/label=\"(?<text>[^\"]+)\",\\s*node=\"(?<value>[^\"]+)\"/",
         "regexApplyTo": "value",
         "sort": 3,
         "type": "query"
