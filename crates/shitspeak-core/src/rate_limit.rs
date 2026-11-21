@@ -118,10 +118,10 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
         match buckets.get_mut(key) {
             Some(bucket) => bucket.try_acquire(),
             None => {
-                if buckets.len() >= self.max_entries {
-                    if let Some(evicted_key) = buckets.keys().next().cloned() {
-                        buckets.remove(&evicted_key);
-                    }
+                if buckets.len() >= self.max_entries
+                    && let Some(evicted_key) = buckets.keys().next().cloned()
+                {
+                    buckets.remove(&evicted_key);
                 }
                 let mut bucket = TokenBucket::new(self.rate_per_second, self.burst);
                 let acquired = bucket.try_acquire();
