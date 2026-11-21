@@ -511,6 +511,12 @@ pub struct Client {
     /// fan-out reads it for every recipient on every packet, while the
     /// bind/unbind paths write it only on rare events.
     udp_address: ParkingRwLock<Option<SocketAddr>>,
+    /// The server address this client's UDP datagrams arrive at, so voice goes
+    /// back from the same address. Kept separate from `local_address`, which
+    /// is the TCP connection's: behind a proxy the two can differ, and a
+    /// socket connected to the address it dialled drops datagrams from any
+    /// other. `None` until a datagram reports it.
+    udp_local_ip: ParkingRwLock<Option<IpAddr>>,
     local_address: SocketAddr,
     tls_fingerprints: TlsFingerprints,
     proxy_server_address: Option<SocketAddr>,
@@ -733,6 +739,7 @@ impl Client {
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
+            udp_local_ip: ParkingRwLock::new(None),
             local_address,
             tls_fingerprints,
             proxy_server_address,
@@ -907,6 +914,7 @@ impl Client {
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(None),
+            udp_local_ip: ParkingRwLock::new(None),
             local_address,
             tls_fingerprints: TlsFingerprints::default(),
             proxy_server_address: None,
@@ -994,6 +1002,7 @@ impl Client {
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
+            udp_local_ip: ParkingRwLock::new(None),
             local_address,
             tls_fingerprints: TlsFingerprints::default(),
             proxy_server_address: None,
@@ -1528,6 +1537,27 @@ impl Client {
     /// this session.
     pub fn set_udp_address(&self, addr: Option<SocketAddr>) {
         *self.udp_address.write() = addr;
+        if addr.is_none() {
+            *self.udp_local_ip.write() = None;
+        }
+    }
+
+    /// The server address this client's UDP datagrams arrive at, if known.
+    pub fn get_udp_local_ip(&self) -> Option<IpAddr> {
+        *self.udp_local_ip.read()
+    }
+
+    /// Record the server address a datagram from this client arrived at.
+    /// Called for every authenticated datagram, so it takes the write lock
+    /// only when the address actually changed. A datagram that does not
+    /// report one (`None`) leaves the last known address in place.
+    pub fn note_udp_local_ip(&self, ip: Option<IpAddr>) {
+        let Some(ip) = ip else {
+            return;
+        };
+        if *self.udp_local_ip.read() != Some(ip) {
+            *self.udp_local_ip.write() = Some(ip);
+        }
     }
 
     pub fn get_real_ip_address(&self) -> IpAddr {

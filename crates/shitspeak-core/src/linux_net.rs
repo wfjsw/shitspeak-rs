@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
@@ -33,6 +33,31 @@ pub fn sendmmsg_to<'a, I>(fd: BorrowedFd<'_>, datagrams: I) -> io::Result<usize>
 where
     I: ExactSizeIterator<Item = (SocketAddr, &'a [u8])>,
 {
+    sendmmsg_to_from(
+        fd,
+        datagrams.map(|(target, payload)| (target, None, payload)),
+    )
+}
+
+/// [`sendmmsg_to`] with an optional source address per datagram.
+///
+/// A socket bound to a wildcard address sends from whichever local address
+/// the kernel selects for the route to the peer. On a host with several
+/// addresses that is not necessarily the address the peer dialled (the kernel
+/// never selects a deprecated address), and a peer whose UDP socket is
+/// connected to the address it dialled drops datagrams from any other. A
+/// `Some(source)` pins the datagram's source address through an
+/// `IP_PKTINFO` / `IPV6_PKTINFO` control message; `None`, or a source whose
+/// family differs from the target's, leaves the choice to the kernel.
+///
+/// A source the kernel rejects (an address that has since been removed) must
+/// not cost the whole batch: when the call fails with `EINVAL`,
+/// `EADDRNOTAVAIL` or `ENETUNREACH` it is retried once without any source, so
+/// those datagrams go out from the kernel's choice instead.
+pub fn sendmmsg_to_from<'a, I>(fd: BorrowedFd<'_>, datagrams: I) -> io::Result<usize>
+where
+    I: ExactSizeIterator<Item = (SocketAddr, Option<IpAddr>, &'a [u8])>,
+{
     let fd = fd.as_raw_fd();
     let mut datagrams = Some(datagrams);
     match SENDMMSG_BUFFERS.try_with(|shared| {
@@ -51,6 +76,21 @@ where
                 .take()
                 .expect("TLS failure must leave the sendmmsg iterator available"),
         ),
+    }
+}
+
+/// Sends one datagram, optionally from a chosen source address; see
+/// [`sendmmsg_to_from`]. A socket that cannot take the datagram right now
+/// yields [`io::ErrorKind::WouldBlock`].
+pub fn send_to_from(
+    fd: BorrowedFd<'_>,
+    target: SocketAddr,
+    source: Option<IpAddr>,
+    payload: &[u8],
+) -> io::Result<usize> {
+    match sendmmsg_to_from(fd, std::iter::once((target, source, payload)))? {
+        0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        _ => Ok(payload.len()),
     }
 }
 
@@ -73,7 +113,7 @@ impl SendMmsgBuffers {
 
     fn send_to<'a, I>(&mut self, fd: RawFd, datagrams: I) -> io::Result<usize>
     where
-        I: ExactSizeIterator<Item = (SocketAddr, &'a [u8])>,
+        I: ExactSizeIterator<Item = (SocketAddr, Option<IpAddr>, &'a [u8])>,
     {
         let expected = datagrams.len();
         if expected > MAX_SENDMMSG_DATAGRAMS {
@@ -89,13 +129,18 @@ impl SendMmsgBuffers {
         self.libc_messages.clear();
 
         self.prepared.reserve(expected);
-        for (target, payload) in datagrams {
+        let mut any_source = false;
+        for (target, source, payload) in datagrams {
             if self.prepared.len() == MAX_SENDMMSG_DATAGRAMS {
                 self.prepared.clear();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "sendmmsg vector is too large",
                 ));
+            }
+            let mut control = SourceControl::EMPTY;
+            if let Some(source) = source {
+                any_source |= control.set_source(target, source);
             }
             self.prepared.push(PreparedDatagram {
                 addr: SocketAddrBuffer::new(target),
@@ -104,21 +149,24 @@ impl SendMmsgBuffers {
                     iov_base: payload.as_ptr().cast_mut().cast(),
                     iov_len: payload.len(),
                 },
+                control,
             });
         }
 
         self.messages.reserve(self.prepared.len());
         for prepared in &mut self.prepared {
-            self.messages.push(SendMmsgHdr::no_control(
+            self.messages.push(SendMmsgHdr::new(
                 prepared.addr.as_mut_ptr(),
                 prepared.addr.len(),
                 &mut prepared.iovec,
+                prepared.control.as_mut_ptr(),
+                prepared.control.len(),
             ));
         }
 
         // SAFETY: every nested pointer targets `prepared` or a payload yielded
         // above. Neither is changed until the synchronous syscall returns.
-        let result = unsafe {
+        let mut result = unsafe {
             sendmmsg(
                 fd,
                 &mut self.messages,
@@ -126,6 +174,35 @@ impl SendMmsgBuffers {
                 &mut self.libc_messages,
             )
         };
+
+        // `sendmmsg` fails as a whole only when its first datagram fails, so
+        // nothing was sent yet and the batch can be retried as it stands. A
+        // source the host no longer has fails the route lookup for IPv4
+        // (`ENETUNREACH`) and the address check for IPv6 (`EINVAL` /
+        // `EADDRNOTAVAIL`). A peer that is genuinely unreachable fails the
+        // retry the same way and that error is what the caller sees.
+        if any_source
+            && matches!(
+                &result,
+                Err(error) if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::EADDRNOTAVAIL | libc::ENETUNREACH)
+                )
+            )
+        {
+            for message in &mut self.messages {
+                message.clear_control();
+            }
+            // SAFETY: as above; only the control pointers were reset.
+            result = unsafe {
+                sendmmsg(
+                    fd,
+                    &mut self.messages,
+                    #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+                    &mut self.libc_messages,
+                )
+            };
+        }
 
         // Retain capacity, but do not retain stale pointers to caller-owned
         // payloads after the synchronous operation has completed.
@@ -140,6 +217,103 @@ impl SendMmsgBuffers {
 struct PreparedDatagram {
     addr: SocketAddrBuffer,
     iovec: libc::iovec,
+    control: SourceControl,
+}
+
+/// Room for one `IP_PKTINFO` (`CMSG_SPACE` 32) or `IPV6_PKTINFO` (40)
+/// control message on a 64-bit target.
+const SOURCE_CONTROL_BYTES: usize = 40;
+
+const _: () = {
+    // SAFETY: `CMSG_SPACE` is alignment arithmetic on its argument.
+    unsafe {
+        assert!(
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint) as usize
+                <= SOURCE_CONTROL_BYTES
+        );
+        assert!(
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as libc::c_uint) as usize
+                <= SOURCE_CONTROL_BYTES
+        );
+    }
+};
+
+/// The control message that selects one datagram's source address. Empty
+/// (`len() == 0`) leaves the source to the kernel.
+#[repr(C, align(8))]
+struct SourceControl {
+    bytes: [u8; SOURCE_CONTROL_BYTES],
+    len: usize,
+}
+
+impl SourceControl {
+    const EMPTY: Self = Self {
+        bytes: [0; SOURCE_CONTROL_BYTES],
+        len: 0,
+    };
+
+    /// Select `source` for a datagram to `target`. Only a source of the
+    /// target's address family can apply; returns whether one was written.
+    fn set_source(&mut self, target: SocketAddr, source: IpAddr) -> bool {
+        match (source, target) {
+            (IpAddr::V4(source), SocketAddr::V4(_)) => {
+                let info = libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_spec_dst: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(source.octets()),
+                    },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                };
+                self.write(libc::IPPROTO_IP, libc::IP_PKTINFO, &info);
+                true
+            }
+            (IpAddr::V6(source), SocketAddr::V6(target)) => {
+                let info = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr {
+                        s6_addr: source.octets(),
+                    },
+                    // A link-local source is only meaningful with its interface.
+                    ipi6_ifindex: target.scope_id(),
+                };
+                self.write(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &info);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write<T>(&mut self, level: libc::c_int, kind: libc::c_int, payload: &T) {
+        let data_len = std::mem::size_of::<T>() as libc::c_uint;
+        // SAFETY: `CMSG_SPACE` is alignment arithmetic on its argument.
+        let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
+        assert!(space <= SOURCE_CONTROL_BYTES);
+        let header = self.bytes.as_mut_ptr().cast::<libc::cmsghdr>();
+        // SAFETY: `bytes` is 8-byte aligned (`repr(align(8))`) and holds at
+        // least `CMSG_SPACE(data_len)` bytes, so the header and its data fit.
+        unsafe {
+            (*header).cmsg_level = level;
+            (*header).cmsg_type = kind;
+            (*header).cmsg_len = libc::CMSG_LEN(data_len) as _;
+            std::ptr::copy_nonoverlapping(
+                (payload as *const T).cast::<u8>(),
+                libc::CMSG_DATA(header),
+                data_len as usize,
+            );
+        }
+        self.len = space;
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        if self.len == 0 {
+            std::ptr::null_mut()
+        } else {
+            self.bytes.as_mut_ptr().cast()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 #[repr(C)]
@@ -195,7 +369,8 @@ impl SocketAddrBuffer {
     }
 }
 
-/// A no-ancillary-data message with the layout expected by the selected path.
+/// A message with the layout expected by the selected path. The control
+/// pointer is null and its length zero unless a source address is selected.
 #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
 #[repr(C)]
 struct SendMmsgHdr {
@@ -219,10 +394,12 @@ struct SendMmsgHdr {
 }
 
 impl SendMmsgHdr {
-    fn no_control(
+    fn new(
         msg_name: *mut libc::c_void,
         msg_namelen: libc::socklen_t,
         msg_iov: *mut libc::iovec,
+        msg_control: *mut libc::c_void,
+        msg_controllen: usize,
     ) -> Self {
         #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
         {
@@ -232,8 +409,8 @@ impl SendMmsgHdr {
                 msg_namelen_pad: 0,
                 msg_iov,
                 msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
+                msg_control,
+                msg_controllen: msg_controllen as libc::c_ulong,
                 msg_flags: 0,
                 msg_flags_pad: 0,
                 msg_len: 0,
@@ -248,7 +425,24 @@ impl SendMmsgHdr {
             inner.msg_hdr.msg_namelen = msg_namelen;
             inner.msg_hdr.msg_iov = msg_iov;
             inner.msg_hdr.msg_iovlen = 1;
+            inner.msg_hdr.msg_control = msg_control;
+            inner.msg_hdr.msg_controllen = msg_controllen as _;
             Self { inner }
+        }
+    }
+
+    /// Drop the control message, leaving the source to the kernel.
+    fn clear_control(&mut self) {
+        #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+        {
+            self.msg_control = std::ptr::null_mut();
+            self.msg_controllen = 0;
+        }
+
+        #[cfg(not(all(target_env = "musl", target_pointer_width = "64")))]
+        {
+            self.inner.msg_hdr.msg_control = std::ptr::null_mut();
+            self.inner.msg_hdr.msg_controllen = 0;
         }
     }
 }
@@ -327,6 +521,8 @@ unsafe fn sendmmsg_via_libc(
         libc_message.msg_hdr.msg_namelen = message.msg_namelen as libc::socklen_t;
         libc_message.msg_hdr.msg_iov = message.msg_iov;
         libc_message.msg_hdr.msg_iovlen = message.msg_iovlen as libc::c_int;
+        libc_message.msg_hdr.msg_control = message.msg_control;
+        libc_message.msg_hdr.msg_controllen = message.msg_controllen as _;
         libc_messages.push(libc_message);
     }
 
@@ -393,6 +589,113 @@ mod tests {
             let received = receiver.recv(&mut buffer).expect("receive datagram");
             assert_eq!(&buffer[..received], expected);
         }
+    }
+
+    /// A wildcard-bound sender and a loopback receiver. All of 127.0.0.0/8 is
+    /// local, so 127.0.0.2 stands in for a second address of the host; with no
+    /// source selected the kernel answers a 127.0.0.1 peer from 127.0.0.1.
+    fn wildcard_sender_and_receiver() -> (std::net::UdpSocket, std::net::UdpSocket, SocketAddr) {
+        let sender = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind sender");
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("set timeout");
+        let target = receiver.local_addr().expect("receiver address");
+        (sender, receiver, target)
+    }
+
+    fn source_of_next(receiver: &std::net::UdpSocket, expected_payload: &[u8]) -> IpAddr {
+        let mut buffer = [0_u8; 16];
+        let (received, from) = receiver.recv_from(&mut buffer).expect("receive datagram");
+        assert_eq!(&buffer[..received], expected_payload);
+        from.ip()
+    }
+
+    #[test]
+    fn selected_source_address_is_used_per_datagram() {
+        let (sender, receiver, target) = wildcard_sender_and_receiver();
+        let second: IpAddr = [127, 0, 0, 2].into();
+
+        let sent = sendmmsg_to_from(
+            sender.as_fd(),
+            [
+                (target, Some(second), b"pinned".as_slice()),
+                (target, None, b"unpinned".as_slice()),
+                (target, Some(second), b"pinned again".as_slice()),
+            ]
+            .into_iter(),
+        )
+        .expect("send datagrams");
+        assert_eq!(sent, 3);
+
+        assert_eq!(source_of_next(&receiver, b"pinned"), second);
+        assert_eq!(
+            source_of_next(&receiver, b"unpinned"),
+            IpAddr::from([127, 0, 0, 1]),
+            "a datagram without a source keeps the kernel's choice"
+        );
+        assert_eq!(source_of_next(&receiver, b"pinned again"), second);
+    }
+
+    #[test]
+    fn source_of_another_family_is_ignored() {
+        let (sender, receiver, target) = wildcard_sender_and_receiver();
+
+        let sent = sendmmsg_to_from(
+            sender.as_fd(),
+            std::iter::once((
+                target,
+                Some(IpAddr::from(std::net::Ipv6Addr::LOCALHOST)),
+                b"mixed".as_slice(),
+            )),
+        )
+        .expect("send datagram");
+        assert_eq!(sent, 1);
+        assert_eq!(
+            source_of_next(&receiver, b"mixed"),
+            IpAddr::from([127, 0, 0, 1])
+        );
+    }
+
+    /// An address the host no longer has must not cost the batch: the kernel
+    /// rejects the source with `EINVAL`, and the datagrams go out without it.
+    #[test]
+    fn rejected_source_address_does_not_drop_the_batch() {
+        let (sender, receiver, target) = wildcard_sender_and_receiver();
+        let not_local: IpAddr = [203, 0, 113, 9].into();
+        let second: IpAddr = [127, 0, 0, 2].into();
+
+        let sent = sendmmsg_to_from(
+            sender.as_fd(),
+            [
+                (target, Some(not_local), b"stale".as_slice()),
+                (target, Some(second), b"valid".as_slice()),
+            ]
+            .into_iter(),
+        )
+        .expect("batch with a stale source still sends");
+        assert_eq!(sent, 2);
+
+        assert_eq!(
+            source_of_next(&receiver, b"stale"),
+            IpAddr::from([127, 0, 0, 1])
+        );
+        assert_eq!(
+            source_of_next(&receiver, b"valid"),
+            IpAddr::from([127, 0, 0, 1])
+        );
+    }
+
+    #[test]
+    fn send_to_from_pins_a_single_datagram() {
+        let (sender, receiver, target) = wildcard_sender_and_receiver();
+        let second: IpAddr = [127, 0, 0, 2].into();
+
+        assert_eq!(
+            send_to_from(sender.as_fd(), target, Some(second), b"one").expect("send"),
+            3
+        );
+        assert_eq!(source_of_next(&receiver, b"one"), second);
     }
 
     #[test]

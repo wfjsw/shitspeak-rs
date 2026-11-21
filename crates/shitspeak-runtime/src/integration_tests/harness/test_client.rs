@@ -970,15 +970,33 @@ impl TestClient {
         Ok(())
     }
 
+    /// Aim this client's UDP datagrams at another local address of the
+    /// server (same port), to exercise a multi-homed host.
+    #[cfg(target_os = "linux")]
+    pub fn set_udp_server_ip(&mut self, ip: std::net::IpAddr) {
+        self.udp_server_addr = SocketAddr::new(ip, self.udp_server_addr.port());
+    }
+
     /// Receive and decrypt the next UDP ping reply for this client.
     pub async fn recv_udp_ping(&self, deadline: Duration) -> Option<PingRequest> {
+        self.recv_udp_ping_with_source(deadline)
+            .await
+            .map(|(ping, _source)| ping)
+    }
+
+    /// Like [`recv_udp_ping`](Self::recv_udp_ping), also returning the
+    /// address the reply datagram came from.
+    pub async fn recv_udp_ping_with_source(
+        &self,
+        deadline: Duration,
+    ) -> Option<(PingRequest, SocketAddr)> {
         let socket = self.udp.as_ref().expect("open_udp first").clone();
         let crypt = self.crypt.as_ref().expect("crypt state").clone();
 
         let res = timeout(deadline, async {
             let mut buf = vec![0u8; 2048];
             loop {
-                let (n, _src) = socket.recv_from(&mut buf).await.ok()?;
+                let (n, source) = socket.recv_from(&mut buf).await.ok()?;
                 let mut decrypted = BytesMut::new();
                 {
                     let mut state = crypt.lock();
@@ -989,7 +1007,7 @@ impl TestClient {
                 if let Ok(IncomingUdpPacket::Ping(ping)) =
                     IncomingUdpPacket::decode(&decrypted, None)
                 {
-                    return Some(ping);
+                    return Some((ping, source));
                 }
             }
         })
@@ -1056,11 +1074,33 @@ impl TestClient {
     /// Like [`recv_voice_udp`] but skips packets that don't satisfy `predicate`.
     /// Useful when the queue contains "handshake echo" packets that arrive
     /// before the audio you actually want to assert on.
-    pub async fn recv_voice_udp_until<F>(
+    pub async fn recv_voice_udp_until<F>(&self, predicate: F, deadline: Duration) -> Option<Audio>
+    where
+        F: FnMut(&Audio) -> bool,
+    {
+        self.recv_voice_udp_until_with_source(predicate, deadline)
+            .await
+            .map(|(audio, _source)| audio)
+    }
+
+    /// Like [`recv_voice_udp`](Self::recv_voice_udp), also returning the
+    /// address the datagram came from.
+    #[cfg(target_os = "linux")]
+    pub async fn recv_voice_udp_with_source(
+        &self,
+        deadline: Duration,
+    ) -> Option<(Audio, SocketAddr)> {
+        self.recv_voice_udp_until_with_source(|_| true, deadline)
+            .await
+    }
+
+    /// [`recv_voice_udp_until`](Self::recv_voice_udp_until) that also returns
+    /// the source address of the matching datagram.
+    pub async fn recv_voice_udp_until_with_source<F>(
         &self,
         mut predicate: F,
         deadline: Duration,
-    ) -> Option<Audio>
+    ) -> Option<(Audio, SocketAddr)>
     where
         F: FnMut(&Audio) -> bool,
     {
@@ -1070,7 +1110,7 @@ impl TestClient {
         let res = timeout(deadline, async {
             let mut buf = vec![0u8; 2048];
             loop {
-                let (n, _src) = socket.recv_from(&mut buf).await.ok()?;
+                let (n, source) = socket.recv_from(&mut buf).await.ok()?;
                 let mut decrypted = BytesMut::new();
                 {
                     let mut state = crypt.lock();
@@ -1092,7 +1132,7 @@ impl TestClient {
                 }
                 if let Some(a) = decode_server_voice(&decrypted) {
                     if predicate(&a) {
-                        return Some(a);
+                        return Some((a, source));
                     }
                 }
             }

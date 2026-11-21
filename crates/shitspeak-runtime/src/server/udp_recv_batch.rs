@@ -1,5 +1,5 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use tokio::net::UdpSocket;
 
@@ -9,6 +9,7 @@ pub(super) const VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS: usize = 32;
 pub(super) struct VoiceUdpDatagram<'a> {
     payload: &'a [u8],
     src_addr: SocketAddr,
+    dst_ip: Option<IpAddr>,
 }
 
 impl<'a> VoiceUdpDatagram<'a> {
@@ -19,6 +20,14 @@ impl<'a> VoiceUdpDatagram<'a> {
     pub(super) fn src_addr(self) -> SocketAddr {
         self.src_addr
     }
+
+    /// The local address the datagram was sent to, when the platform reports
+    /// it. A wildcard-bound socket on a host with several addresses needs this
+    /// to answer from the address the peer actually used; see
+    /// [`send_reply_from`].
+    pub(super) fn dst_ip(self) -> Option<IpAddr> {
+        self.dst_ip
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +35,7 @@ struct VoiceUdpDatagramMeta {
     index: usize,
     len: usize,
     src_addr: SocketAddr,
+    dst_ip: Option<IpAddr>,
 }
 
 pub(super) struct VoiceUdpRecvBatch {
@@ -50,6 +60,7 @@ impl VoiceUdpRecvBatch {
         self.received.iter().map(|meta| VoiceUdpDatagram {
             payload: &self.buffers[meta.index][..meta.len],
             src_addr: meta.src_addr,
+            dst_ip: meta.dst_ip,
         })
     }
 
@@ -58,11 +69,18 @@ impl VoiceUdpRecvBatch {
         self.buffers[0].as_mut_slice()
     }
 
-    fn push_received(&mut self, index: usize, len: usize, src_addr: SocketAddr) {
+    fn push_received(
+        &mut self,
+        index: usize,
+        len: usize,
+        src_addr: SocketAddr,
+        dst_ip: Option<IpAddr>,
+    ) {
         self.received.push(VoiceUdpDatagramMeta {
             index,
             len: len.min(self.buffers[index].len()),
             src_addr: shitspeak_auth::canonical_socket_addr(src_addr),
+            dst_ip: dst_ip.map(|ip| ip.to_canonical()),
         });
     }
 
@@ -94,11 +112,11 @@ async fn recv_each_available(
     batch.clear();
     let (len, src_addr) =
         recv_from_skipping_transient_errors(socket, batch.first_buffer_mut()).await?;
-    batch.push_received(0, len, src_addr);
+    batch.push_received(0, len, src_addr, None);
 
     for index in 1..batch.capacity() {
         match socket.try_recv_from(batch.buffers[index].as_mut_slice()) {
-            Ok((len, src_addr)) => batch.push_received(index, len, src_addr),
+            Ok((len, src_addr)) => batch.push_received(index, len, src_addr, None),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             // Keep what this batch already holds; the next call reads on.
             Err(err) if is_transient_udp_recv_error(&err) => break,
@@ -150,6 +168,8 @@ fn recvmmsg_with_scratch(
         storage: unsafe { std::mem::zeroed() },
         len: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
     });
+    scratch.controls.clear();
+    scratch.controls.resize(cap, ControlBuffer::ZEROED);
 
     // Refresh all pointers after resizing, even when a different batch uses this worker.
     for buffer in &mut batch.buffers {
@@ -165,8 +185,8 @@ fn recvmmsg_with_scratch(
         msg.msg_hdr.msg_namelen = scratch.sockaddrs[index].len;
         msg.msg_hdr.msg_iov = &mut scratch.iovecs[index] as *mut libc::iovec;
         msg.msg_hdr.msg_iovlen = 1;
-        msg.msg_hdr.msg_control = std::ptr::null_mut();
-        msg.msg_hdr.msg_controllen = 0;
+        msg.msg_hdr.msg_control = scratch.controls[index].0.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_hdr.msg_controllen = CONTROL_BUFFER_LEN as _;
         msg.msg_hdr.msg_flags = 0;
         scratch.msgs.push(msg);
     }
@@ -188,7 +208,13 @@ fn recvmmsg_with_scratch(
     for index in 0..received {
         scratch.sockaddrs[index].len = scratch.msgs[index].msg_hdr.msg_namelen;
         let src_addr = socket_addr_from_storage(&scratch.sockaddrs[index])?;
-        batch.push_received(index, scratch.msgs[index].msg_len as usize, src_addr);
+        let dst_ip = destination_ip_from_control(&scratch.msgs[index].msg_hdr);
+        batch.push_received(
+            index,
+            scratch.msgs[index].msg_len as usize,
+            src_addr,
+            dst_ip,
+        );
     }
 
     Ok(received)
@@ -199,6 +225,7 @@ struct RecvMmsgBuffers {
     msgs: Vec<libc::mmsghdr>,
     iovecs: Vec<libc::iovec>,
     sockaddrs: Vec<SocketAddrStorage>,
+    controls: Vec<ControlBuffer>,
 }
 
 #[cfg(target_os = "linux")]
@@ -208,8 +235,156 @@ impl RecvMmsgBuffers {
             msgs: Vec::new(),
             iovecs: Vec::new(),
             sockaddrs: Vec::new(),
+            controls: Vec::new(),
         }
     }
+}
+
+/// Room for the control messages of one datagram. An IPv4 datagram on a
+/// dual-stack socket carries both an `IPV6_PKTINFO` (`CMSG_SPACE` 40, mapped
+/// address) and an `IP_PKTINFO` (32): 72 bytes. Too small a buffer truncates
+/// the messages (`MSG_CTRUNC`) and the destination is then discarded.
+#[cfg(target_os = "linux")]
+const CONTROL_BUFFER_LEN: usize = 128;
+
+/// Ancillary-data buffer; `cmsghdr` needs pointer-size alignment.
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct ControlBuffer([u8; CONTROL_BUFFER_LEN]);
+
+#[cfg(target_os = "linux")]
+impl ControlBuffer {
+    const ZEROED: Self = Self([0; CONTROL_BUFFER_LEN]);
+}
+
+/// Ask the kernel to report, with every received datagram, the local address
+/// it was sent to (`IP_PKTINFO`, plus `IPV6_RECVPKTINFO` on an IPv6 socket).
+///
+/// A socket bound to a wildcard address answers from whichever local address
+/// the kernel selects for the route back to the peer, which on a host with
+/// several addresses is not necessarily the one the peer pinged: the kernel
+/// never selects a deprecated address as a source. Clients pair a reply with
+/// the address it left from, so such a reply is misattributed.
+///
+/// Failure only means replies fall back to the kernel's choice.
+#[cfg(target_os = "linux")]
+pub(super) fn enable_destination_address_reporting(socket: &std::net::UdpSocket) {
+    use std::os::fd::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let enable = |level: libc::c_int, name: libc::c_int| -> io::Result<()> {
+        let on: libc::c_int = 1;
+        // SAFETY: `fd` is a live socket for the borrow and the option value
+        // is a valid `c_int` of the stated length.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+
+    // IPv4 datagrams, including those an IPv6 dual-stack socket receives.
+    let mut result = enable(libc::IPPROTO_IP, libc::IP_PKTINFO);
+    if result.is_ok() && matches!(socket.local_addr(), Ok(SocketAddr::V6(_))) {
+        result = enable(libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO);
+    }
+    if let Err(error) = result {
+        tracing::warn!(
+            %error,
+            "unable to enable UDP destination address reporting; ping replies leave from the kernel-selected source address"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn enable_destination_address_reporting(_socket: &std::net::UdpSocket) {}
+
+/// The destination address carried by a received message's
+/// `IP_PKTINFO` / `IPV6_PKTINFO` control message, if usable as a reply source.
+#[cfg(target_os = "linux")]
+fn destination_ip_from_control(header: &libc::msghdr) -> Option<IpAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    if header.msg_flags & libc::MSG_CTRUNC != 0 {
+        return None;
+    }
+
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(header) };
+    while !cmsg.is_null() {
+        // SAFETY: the kernel filled `msg_control` with well-formed control
+        // messages and `CMSG_FIRSTHDR` / `CMSG_NXTHDR` stay within
+        // `msg_controllen`; payloads are read unaligned.
+        let (level, kind, data) =
+            unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type, libc::CMSG_DATA(cmsg)) };
+        let destination = if level == libc::IPPROTO_IP && kind == libc::IP_PKTINFO {
+            let info = unsafe { std::ptr::read_unaligned(data as *const libc::in_pktinfo) };
+            // `ipi_spec_dst` is the local address replies should leave from;
+            // it equals `ipi_addr` except for broadcast and multicast.
+            let raw = if info.ipi_spec_dst.s_addr != 0 {
+                info.ipi_spec_dst.s_addr
+            } else {
+                info.ipi_addr.s_addr
+            };
+            Some(IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes())))
+        } else if level == libc::IPPROTO_IPV6 && kind == libc::IPV6_PKTINFO {
+            let info = unsafe { std::ptr::read_unaligned(data as *const libc::in6_pktinfo) };
+            Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)))
+        } else {
+            None
+        };
+        if let Some(destination) = destination {
+            let destination = destination.to_canonical();
+            let usable = !destination.is_unspecified()
+                && !destination.is_multicast()
+                && destination != IpAddr::V4(Ipv4Addr::BROADCAST);
+            return usable.then_some(destination);
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(header, cmsg) };
+    }
+    None
+}
+
+/// Send `payload` to `dest` from the local address `source_ip` (the address
+/// the request was sent to) instead of the kernel's route-based choice.
+///
+/// Falls back to a plain `send_to` when the source is unknown or the platform
+/// cannot pin a source; the Linux path is
+/// [`shitspeak_core::linux_net::send_to_from`], which also ignores a source of
+/// the wrong address family and retries without one the kernel rejects.
+pub(super) async fn send_reply_from(
+    socket: &UdpSocket,
+    payload: &[u8],
+    dest: SocketAddr,
+    source_ip: Option<IpAddr>,
+) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    if source_ip.is_some() {
+        use std::os::fd::AsFd;
+
+        loop {
+            socket.writable().await?;
+            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                shitspeak_core::linux_net::send_to_from(socket.as_fd(), dest, source_ip, payload)
+            }) {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = source_ip;
+    socket.send_to(payload, dest).await
 }
 
 #[cfg(target_os = "linux")]
@@ -530,5 +705,154 @@ mod tests {
         let received = batch.iter().next().unwrap();
         assert_eq!(received.payload(), b"ping");
         assert_eq!(received.src_addr(), sender.local_addr().unwrap());
+    }
+
+    /// Wildcard-bound receiver (`0.0.0.0` or dual-stack `[::]`) with
+    /// destination reporting on, plus a loopback sender. All of 127.0.0.0/8
+    /// is local, so 127.0.0.2 stands in for a second address of the host.
+    #[cfg(target_os = "linux")]
+    async fn wildcard_receiver(dual_stack: bool, report_destination: bool) -> (UdpSocket, u16) {
+        let socket = if dual_stack {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            socket.set_only_v6(false).unwrap();
+            socket
+                .bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into())
+                .unwrap();
+            std::net::UdpSocket::from(socket)
+        } else {
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap()
+        };
+        if report_destination {
+            enable_destination_address_reporting(&socket);
+        }
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
+    /// The destination of each datagram is reported, and a reply sent with it
+    /// leaves from that address, for both an IPv4 and a dual-stack socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn batch_reports_destination_and_reply_keeps_it() {
+        for dual_stack in [false, true] {
+            let (receiver, port) = wildcard_receiver(dual_stack, true).await;
+            let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+
+            for pinged in [[127, 0, 0, 1], [127, 0, 0, 2]] {
+                let pinged = std::net::Ipv4Addr::from(pinged);
+                sender.send_to(b"ping", (pinged, port)).await.unwrap();
+
+                let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, 64);
+                timeout(
+                    Duration::from_secs(1),
+                    recv_voice_udp_batch(&receiver, &mut batch),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let received = batch.iter().next().unwrap();
+                assert_eq!(
+                    received.dst_ip(),
+                    Some(IpAddr::V4(pinged)),
+                    "dual_stack={dual_stack}"
+                );
+
+                send_reply_from(&receiver, b"pong", received.src_addr(), received.dst_ip())
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 16];
+                let (len, source) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&buf[..len], b"pong");
+                assert_eq!(
+                    source,
+                    SocketAddr::from((pinged, port)),
+                    "dual_stack={dual_stack}"
+                );
+            }
+        }
+    }
+
+    /// IPv6 destination reporting on a dual-stack socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn batch_reports_ipv6_destination_and_reply_keeps_it() {
+        let (receiver, port) = wildcard_receiver(true, true).await;
+        let sender = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        sender
+            .send_to(b"ping", (Ipv6Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+
+        let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, 64);
+        timeout(
+            Duration::from_secs(1),
+            recv_voice_udp_batch(&receiver, &mut batch),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let received = batch.iter().next().unwrap();
+        assert_eq!(received.dst_ip(), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        send_reply_from(&receiver, b"pong", received.src_addr(), received.dst_ip())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, source) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"pong");
+        assert_eq!(source, SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+    }
+
+    /// Without destination reporting the destination is unknown and replies
+    /// still go out through the plain `send_to` path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unreported_destination_falls_back_to_plain_send() {
+        let (receiver, port) = wildcard_receiver(false, false).await;
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        sender
+            .send_to(b"ping", SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .unwrap();
+
+        let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, 64);
+        timeout(
+            Duration::from_secs(1),
+            recv_voice_udp_batch(&receiver, &mut batch),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let received = batch.iter().next().unwrap();
+        assert_eq!(received.dst_ip(), None);
+
+        send_reply_from(&receiver, b"pong", received.src_addr(), None)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, _) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"pong");
     }
 }

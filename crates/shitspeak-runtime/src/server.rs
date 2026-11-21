@@ -66,7 +66,9 @@ use entrypoints::{
     UdpPacketPool, bind_entrypoint_socket_pair, bind_entrypoints, entrypoint_config_routes,
 };
 use tls::{load_c2s_tls_acceptor, validate_privacy_config};
-use udp_recv_batch::{VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, VoiceUdpRecvBatch, recv_voice_udp_batch};
+use udp_recv_batch::{
+    VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, VoiceUdpRecvBatch, recv_voice_udp_batch, send_reply_from,
+};
 
 const UDP_PROCESSING_MIN_BASELINE_CAPACITY: usize = 1024;
 const UDP_PROCESSING_PACKETS_PER_USER_BASELINE: usize = 16;
@@ -1062,6 +1064,7 @@ impl Server {
                         local_addr,
                         datagram.payload(),
                         datagram.src_addr(),
+                        datagram.dst_ip(),
                         voice_enabled,
                         ping_enabled,
                     )
@@ -1080,6 +1083,7 @@ impl Server {
         local_addr: std::net::SocketAddr,
         packet: &[u8],
         src_addr: std::net::SocketAddr,
+        dst_ip: Option<std::net::IpAddr>,
         voice_enabled: bool,
         ping_enabled: bool,
     ) {
@@ -1128,7 +1132,11 @@ impl Server {
                                 return;
                             }
                         };
-                    match socket.send_to(&reply, src_addr).await {
+                    // Answer from the address that was pinged. Clients key
+                    // their per-address ping state on the reply's source, so a
+                    // reply from another local address of this host is
+                    // misattributed.
+                    match send_reply_from(socket, &reply, src_addr, dst_ip).await {
                         Ok(sent) => {
                             tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent)
                         }
@@ -1176,7 +1184,7 @@ impl Server {
                 depth,
                 capacity,
             );
-            match tx.try_send(UdpPacket::new(packet, src_addr, local_addr)) {
+            match tx.try_send(UdpPacket::new(packet, src_addr, local_addr, dst_ip)) {
                 Ok(()) => {
                     crate::voice::metrics::record_queue_enqueue(
                         crate::voice::metrics::VoiceQueueKind::UdpProcessing,
@@ -1250,7 +1258,7 @@ impl Server {
                     );
                     continue;
                 }
-                let (packet, src_addr, local_addr) = udp_packet.into_parts();
+                let (packet, src_addr, local_addr, dst_ip) = udp_packet.into_parts();
 
                 // Try address-based match first.  If the cached entry exists but
                 // decrypt fails (stale NAT binding, crypt state re-keyed, etc.)
@@ -1450,6 +1458,11 @@ impl Server {
                         .await;
                 }
 
+                // Voice goes back from the address this datagram arrived at: a
+                // client's UDP socket is connected to the address it dialled
+                // and drops datagrams from any other local address.
+                client.note_udp_local_ip(dst_ip);
+
                 // Packet was already decrypted during client matching.
                 let Some(decrypted) = decrypted_from_match else {
                     continue;
@@ -1510,7 +1523,7 @@ impl Server {
                             tracing::warn!("no UDP socket available for ping reply");
                             continue;
                         };
-                        match socket.send_to(&encrypted, src_addr).await {
+                        match send_reply_from(&socket, &encrypted, src_addr, dst_ip).await {
                             Ok(sent) => tracing::trace!(
                                 "authenticated UDP ping reply sent to {}: {} bytes",
                                 src_addr,

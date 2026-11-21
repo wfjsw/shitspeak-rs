@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +13,10 @@ pub(super) struct UdpPacket {
     packet: UdpPacketPayload,
     src_addr: SocketAddr,
     local_addr: SocketAddr,
+    /// The local address the datagram was actually sent to, when the
+    /// platform reports it (`local_addr` is the socket's bound, possibly
+    /// wildcard, address).
+    dst_ip: Option<IpAddr>,
     enqueued_at: Instant,
 }
 
@@ -21,11 +25,13 @@ impl UdpPacket {
         packet: UdpPacketPayload,
         src_addr: SocketAddr,
         local_addr: SocketAddr,
+        dst_ip: Option<IpAddr>,
     ) -> Self {
         Self {
             packet,
             src_addr,
             local_addr,
+            dst_ip,
             enqueued_at: Instant::now(),
         }
     }
@@ -34,8 +40,8 @@ impl UdpPacket {
         self.enqueued_at.elapsed()
     }
 
-    pub(super) fn into_parts(self) -> (UdpPacketPayload, SocketAddr, SocketAddr) {
-        (self.packet, self.src_addr, self.local_addr)
+    pub(super) fn into_parts(self) -> (UdpPacketPayload, SocketAddr, SocketAddr, Option<IpAddr>) {
+        (self.packet, self.src_addr, self.local_addr, self.dst_ip)
     }
 }
 
@@ -258,6 +264,7 @@ fn bind_udp_socket(
 ) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
     let socket = std::net::UdpSocket::bind(address)?;
     super::udp_recv_batch::disable_udp_connection_reset_reports(&socket);
+    super::udp_recv_batch::enable_destination_address_reporting(&socket);
     socket.set_nonblocking(true)?;
     let _runtime_guard = udp_runtime.enter();
     tokio::net::UdpSocket::from_std(socket).map(Arc::new)

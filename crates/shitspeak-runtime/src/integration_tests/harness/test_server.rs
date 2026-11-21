@@ -41,6 +41,9 @@ const BANS_REPLICATION_TOPIC: &str = "bans";
 
 #[derive(Debug, Clone)]
 pub struct TestServerOpts {
+    /// Entrypoint listen address. Binding a wildcard (`0.0.0.0:0`, `[::]:0`)
+    /// lets a test reach the server through several local addresses.
+    pub listen: String,
     pub max_users: u64,
     pub cert_required: bool,
     pub welcome_text: Option<String>,
@@ -75,6 +78,7 @@ pub struct TestServerOpts {
 impl Default for TestServerOpts {
     fn default() -> Self {
         Self {
+            listen: "127.0.0.1:0".into(),
             max_users: 100,
             cert_required: false,
             welcome_text: Some("test-welcome".into()),
@@ -510,7 +514,7 @@ async fn spawn_test_server_with_pki(
     let (cert_path, key_path) = pki.nodes[cert_index].clone();
 
     let config = Config {
-        listen: "127.0.0.1:0".into(),
+        listen: opts.listen.clone(),
         server_entrypoints: Vec::new(),
         register_name: "test".into(),
         register_password: None,
@@ -599,8 +603,21 @@ async fn spawn_test_server_with_pki(
         server.s2s_manager().install_test_inbound_chaos(chaos);
     }
 
-    let addr = server.local_addr().expect("local_addr");
-    let udp_addr = server.local_udp_addr().expect("local_udp_addr");
+    // A wildcard bind reports `0.0.0.0` / `::`, which is not a destination a
+    // client can name; tests reach it over loopback.
+    let reachable = |bound: SocketAddr| {
+        if bound.ip().is_unspecified() {
+            let loopback: std::net::IpAddr = match bound {
+                SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            };
+            SocketAddr::new(loopback, bound.port())
+        } else {
+            bound
+        }
+    };
+    let addr = reachable(server.local_addr().expect("local_addr"));
+    let udp_addr = reachable(server.local_udp_addr().expect("local_udp_addr"));
 
     let run_handle = tokio::spawn({
         let server = Arc::clone(&server);

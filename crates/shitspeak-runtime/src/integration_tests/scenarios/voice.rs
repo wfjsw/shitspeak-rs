@@ -3361,6 +3361,130 @@ async fn voice_udp_ping_echoes_encrypted_timestamp() {
     assert_eq!(ping.format, PacketFormat::Legacy);
 }
 
+/// Regression: a Mumble client pings every address a hostname resolves to and
+/// un-masks each reply's timestamp with a random value kept *per address it
+/// pinged*. A reply that leaves from a different local address than the one
+/// pinged is therefore un-masked with the wrong random, and the client's ping
+/// column overflows. This is what happened on a host whose second IPv6 address
+/// was deprecated: the kernel never selects a deprecated address as a source,
+/// so pings to it were answered from the other one.
+///
+/// Expected: on a wildcard-bound entrypoint, every unauthenticated ping reply
+/// (legacy and protobuf) comes from the exact local address it was sent to.
+/// Loopback stands in for the multi-homed host (all of 127.0.0.0/8 is local);
+/// without a source-address pin the kernel answers a 127.0.0.1 peer from
+/// 127.0.0.1 whatever address was pinged.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn voice_udp_unauthenticated_ping_reply_leaves_from_the_pinged_address() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    const LEGACY_IDENT: u64 = 0x0123_4567_89ab_cdef;
+
+    // (listen, local address the client binds, addresses of the server to ping)
+    let cases: [(&str, IpAddr, &[IpAddr]); 3] = [
+        (
+            "0.0.0.0:0",
+            Ipv4Addr::LOCALHOST.into(),
+            &[
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::new(127, 0, 0, 2).into(),
+            ],
+        ),
+        (
+            // Dual-stack socket serving IPv4 peers: the production shape.
+            "[::]:0",
+            Ipv4Addr::LOCALHOST.into(),
+            &[
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::new(127, 0, 0, 2).into(),
+            ],
+        ),
+        (
+            "[::]:0",
+            Ipv6Addr::LOCALHOST.into(),
+            &[Ipv6Addr::LOCALHOST.into()],
+        ),
+    ];
+
+    for (listen, client_ip, pinged_addresses) in cases {
+        let server = spawn_test_server(TestServerOpts {
+            listen: listen.into(),
+            ..TestServerOpts::default()
+        })
+        .await;
+        let port = server.udp_addr.port();
+        let client = tokio::net::UdpSocket::bind(SocketAddr::new(client_ip, 0))
+            .await
+            .expect("client udp bind");
+
+        for &pinged in pinged_addresses {
+            let target = SocketAddr::new(pinged, port);
+
+            let mut legacy = vec![0u8; 4];
+            legacy.extend_from_slice(&LEGACY_IDENT.to_be_bytes());
+            // `MumbleUDP.Ping { timestamp: 42 }` behind its 0x01 type byte.
+            let protobuf = [0x01u8, 0x08, 42];
+
+            for (label, packet) in [("legacy", &legacy[..]), ("protobuf", &protobuf[..])] {
+                client.send_to(packet, target).await.expect("send ping");
+                let mut buf = [0u8; 128];
+                let (len, source) =
+                    tokio::time::timeout(VOICE_DEADLINE, client.recv_from(&mut buf))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("{label} ping to {target} (listen {listen}) got no reply")
+                        })
+                        .expect("recv ping reply");
+                assert!(len > 1, "{label} reply to {target} is empty");
+                assert_eq!(
+                    source.ip(),
+                    pinged,
+                    "{label} ping sent to {target} (listen {listen}) was answered from {source}"
+                );
+                assert_eq!(source.port(), port);
+            }
+        }
+    }
+}
+
+/// Same invariant for the encrypted ping echo an authenticated client's UDP
+/// socket exchanges: the client's UDP socket is connected to the address it
+/// dialled, so an echo from any other address is dropped and UDP is never
+/// confirmed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn voice_udp_authenticated_ping_echo_leaves_from_the_pinged_address() {
+    let server = spawn_test_server(TestServerOpts {
+        listen: "0.0.0.0:0".into(),
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let mut alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    alice.open_udp().await.expect("alice udp bind");
+
+    let second_address = std::net::Ipv4Addr::new(127, 0, 0, 2);
+    alice.set_udp_server_ip(second_address.into());
+    alice.udp_handshake().await.expect("alice udp ping");
+
+    let (ping, source) = alice
+        .recv_udp_ping_with_source(VOICE_DEADLINE)
+        .await
+        .expect("encrypted udp ping response");
+    assert_eq!(ping.timestamp, 1);
+    assert_eq!(
+        source.ip(),
+        std::net::IpAddr::from(second_address),
+        "echo to a ping sent to {second_address} came from {source}"
+    );
+}
+
 /// Checks real UDP voice routing, encryption, and decryption for one channel.
 /// Expected: Bob decrypts Alice's byte-identical Opus payload and sender
 /// session. This follows Mumble's UDP decrypt/route/encrypt path in
@@ -3400,6 +3524,64 @@ async fn voice_udp_same_channel_round_trips_and_decrypts() {
         "opus payload should round-trip byte-identical through OCB2 + routing"
     );
     assert_eq!(audio.sender_session, Some(alice.server_session));
+}
+
+/// Regression: a client's UDP socket is connected to the server address it
+/// dialled, so voice that leaves from any other local address of a multi-homed
+/// host is dropped by the client and its UDP path never works (it falls back
+/// to the TCP tunnel). The kernel never selects a deprecated address as a
+/// source, so voice for a client that dialled one left from a different
+/// address.
+///
+/// Expected: on a wildcard-bound entrypoint, UDP voice reaches a client from
+/// the exact local address that client's datagrams were sent to. This covers
+/// the sequential fan-out; the rayon fan-out's `encrypt_udp_recipients` has
+/// its own unit test in `voice::routing`. Loopback stands in for the host (all
+/// of 127.0.0.0/8 is local); an unpinned reply to a 127.0.0.1 peer leaves from
+/// 127.0.0.1.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn voice_udp_fanout_leaves_from_the_address_the_client_dialled() {
+    let second_address: std::net::IpAddr = std::net::Ipv4Addr::new(127, 0, 0, 2).into();
+
+    let server = spawn_test_server(TestServerOpts {
+        listen: "0.0.0.0:0".into(),
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let mut alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let mut bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice.set_udp_server_ip(second_address);
+    bob.set_udp_server_ip(second_address);
+
+    open_udp_pair(&mut alice, &mut bob).await;
+
+    alice
+        .send_voice_udp(0, 100, Bytes::from_static(SAMPLE_OPUS))
+        .await
+        .expect("alice send_voice_udp");
+
+    let (audio, source) = bob
+        .recv_voice_udp_with_source(VOICE_DEADLINE)
+        .await
+        .expect("Bob should receive Alice's voice over real UDP");
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+    assert_eq!(
+        source.ip(),
+        second_address,
+        "voice for a client that dialled {second_address} left from {source}"
+    );
 }
 
 /// Checks TCP-tunneled voice using the Mumble 1.5 protobuf audio format.

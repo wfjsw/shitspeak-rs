@@ -2289,9 +2289,10 @@ fn encrypt_udp_recipients(
             .entry(*local_addr)
             .or_insert_with(DatagramBatch::new);
         let encrypt_started_at = Instant::now();
-        let _ = batch.try_push_zeroed(*addr, encrypted_len, |buf| {
-            state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
-        });
+        let _ =
+            batch.try_push_zeroed_from(*addr, client.get_udp_local_ip(), encrypted_len, |buf| {
+                state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
+            });
         super::metrics::record_pipeline_stage(
             path,
             VoicePipelineStage::UdpEncryptQueue,
@@ -2366,9 +2367,12 @@ pub(crate) async fn flush_voice_batch(
                 .entry(local_addr)
                 .or_insert_with(|| DatagramBatch::with_capacity(targets.len()));
             let encrypt_started_at = Instant::now();
-            let encrypt_result = udp_batch.try_push_zeroed(addr, encrypted_len, |buf| {
-                state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
-            });
+            let encrypt_result = udp_batch.try_push_zeroed_from(
+                addr,
+                client.get_udp_local_ip(),
+                encrypted_len,
+                |buf| state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum),
+            );
             record_pipeline_stage(
                 path,
                 VoicePipelineStage::UdpEncryptQueue,
@@ -2978,6 +2982,105 @@ mod tests {
             elapsed < std::time::Duration::from_millis(5),
             "encryption waited {elapsed:?} on the decrypt side"
         );
+    }
+
+    /// The large fan-out encrypts through `encrypt_udp_recipients`: each
+    /// recipient's datagram must leave from the server address that
+    /// recipient's datagrams arrive at (see `Client::note_udp_local_ip`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn encrypted_recipients_leave_from_the_clients_udp_local_ip() {
+        let pinned = crypt_test_client(8);
+        let unpinned = crypt_test_client(9);
+        let second: std::net::IpAddr = [127, 0, 0, 2].into();
+        pinned.note_udp_local_ip(Some(second));
+
+        let pinned_peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unpinned_peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let socket_addr = socket.local_addr().unwrap();
+
+        let plaintext = Bytes::from_static(&[0xAB; 64]);
+        let plaintexts: Vec<VoicePlaintext> = vec![(
+            (PacketFormat::Protobuf, AudioContext::Normal),
+            Encoded {
+                checksum: shitspeak_client_crypto::CryptState::compute_plaintext_checksum(
+                    &plaintext,
+                ),
+                bytes: plaintext,
+            },
+        )];
+        let recipients: Vec<UdpVoiceRecipient> = vec![
+            (
+                pinned,
+                socket_addr,
+                pinned_peer.local_addr().unwrap(),
+                PacketFormat::Protobuf,
+                AudioContext::Normal,
+            ),
+            (
+                unpinned,
+                socket_addr,
+                unpinned_peer.local_addr().unwrap(),
+                PacketFormat::Protobuf,
+                AudioContext::Normal,
+            ),
+        ];
+        let batches =
+            encrypt_udp_recipients(&recipients, &plaintexts, VoicePipelinePath::LocalSequential);
+        // A fresh socket has not been polled yet, and `flush_batch` only
+        // tries the send; wait for the reactor to report it writable.
+        socket.writable().await.unwrap();
+        for batch in batches.values() {
+            udp_batch::flush_batch(&socket, batch).await.unwrap();
+        }
+
+        let mut buf = [0u8; 256];
+        let (_, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pinned_peer.recv_from(&mut buf),
+        )
+        .await
+        .expect("pinned recipient receives voice")
+        .unwrap();
+        assert_eq!(from.ip(), second);
+        let (_, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            unpinned_peer.recv_from(&mut buf),
+        )
+        .await
+        .expect("unpinned recipient receives voice")
+        .unwrap();
+        assert_eq!(
+            from.ip(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            "a client whose UDP-local address is unknown keeps the kernel's choice"
+        );
+    }
+
+    #[test]
+    fn udp_local_ip_follows_received_datagrams_and_the_udp_binding() {
+        let client = crypt_test_client(10);
+        assert_eq!(client.get_udp_local_ip(), None);
+
+        let first: std::net::IpAddr = [127, 0, 0, 2].into();
+        let second: std::net::IpAddr = [127, 0, 0, 3].into();
+        client.note_udp_local_ip(Some(first));
+        assert_eq!(client.get_udp_local_ip(), Some(first));
+
+        // A datagram that cannot report its destination keeps what is known.
+        client.note_udp_local_ip(None);
+        assert_eq!(client.get_udp_local_ip(), Some(first));
+
+        // A client that moves to another server address is followed.
+        client.note_udp_local_ip(Some(second));
+        assert_eq!(client.get_udp_local_ip(), Some(second));
+
+        // Binding a UDP address keeps it; unbinding forgets it.
+        client.set_udp_address(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 50_010))));
+        assert_eq!(client.get_udp_local_ip(), Some(second));
+        client.set_udp_address(None);
+        assert_eq!(client.get_udp_local_ip(), None);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! platforms we fall back to a simple loop of `send_to` calls.
 
 use std::cell::RefCell;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -25,6 +25,10 @@ const MAX_POOLED_DATAGRAMS: usize = 2048;
 
 struct QueuedDatagram {
     addr: SocketAddr,
+    /// Local address to send from. `None` leaves the choice to the kernel.
+    /// Only the Linux `sendmmsg` path can pin it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    source: Option<IpAddr>,
     chunk: usize,
     offset: usize,
     len: usize,
@@ -169,6 +173,24 @@ impl DatagramBatch {
         len: usize,
         write: impl FnOnce(&mut [u8]) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.try_push_zeroed_from(addr, None, len, write)
+    }
+
+    /// [`try_push_zeroed`](Self::try_push_zeroed) with the local address the
+    /// datagram must leave from.
+    ///
+    /// A socket bound to a wildcard address otherwise sends from whichever
+    /// local address the kernel selects for the route, which on a host with
+    /// several addresses need not be the one the peer dialled. A peer whose
+    /// UDP socket is connected to that address drops anything from another.
+    /// Ignored off Linux.
+    pub fn try_push_zeroed_from<E>(
+        &mut self,
+        addr: SocketAddr,
+        source: Option<IpAddr>,
+        len: usize,
+        write: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
         let created_chunk = self.ensure_chunk(len);
         let chunk = self.chunks.len() - 1;
         let offset = self.chunks[chunk].len();
@@ -178,6 +200,7 @@ impl DatagramBatch {
             Ok(()) => {
                 self.datagrams.push(QueuedDatagram {
                     addr,
+                    source,
                     chunk,
                     offset,
                     len,
@@ -384,11 +407,11 @@ fn sendmmsg_chunk(
     batch: &DatagramBatch,
     chunk: &[QueuedDatagram],
 ) -> io::Result<usize> {
-    shitspeak_core::linux_net::sendmmsg_to(
+    shitspeak_core::linux_net::sendmmsg_to_from(
         fd,
         chunk
             .iter()
-            .map(|datagram| (datagram.addr, batch.data(datagram))),
+            .map(|datagram| (datagram.addr, datagram.source, batch.data(datagram))),
     )
 }
 
@@ -432,6 +455,9 @@ mod tests {
             })
             .expect("queue datagram");
 
+        // A fresh socket has not been polled yet, and `flush_batch` only
+        // tries the send; wait for the reactor to report it writable.
+        sender.writable().await.expect("sender writable");
         flush_batch(&sender, &batch).await.expect("flush batch");
 
         let mut buf = [0; 16];
@@ -442,5 +468,49 @@ mod tests {
 
         assert_eq!(&buf[..len], payload);
         assert_eq!(from_addr, sender_addr);
+    }
+
+    /// Queued datagrams carry their own source address through `flush_batch`:
+    /// a wildcard-bound socket sends the pinned one from 127.0.0.2 (all of
+    /// 127.0.0.0/8 is local) and the other from the kernel's choice.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn flush_batch_sends_each_datagram_from_its_own_source() {
+        let sender = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("bind sender");
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind receiver");
+        let target = receiver.local_addr().expect("receiver local addr");
+        let second: IpAddr = [127, 0, 0, 2].into();
+
+        let mut batch = DatagramBatch::new();
+        for (payload, source) in [
+            (b"pinned".as_slice(), Some(second)),
+            (b"default".as_slice(), None),
+        ] {
+            batch
+                .try_push_zeroed_from(target, source, payload.len(), |buf| {
+                    buf.copy_from_slice(payload);
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("queue datagram");
+        }
+        sender.writable().await.expect("sender writable");
+        flush_batch(&sender, &batch).await.expect("flush batch");
+
+        let mut buf = [0; 16];
+        for (expected, expected_source) in [
+            (b"pinned".as_slice(), second),
+            (b"default".as_slice(), IpAddr::from([127, 0, 0, 1])),
+        ] {
+            let (len, from) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+                .await
+                .expect("receive timeout")
+                .expect("receive datagram");
+            assert_eq!(&buf[..len], expected);
+            assert_eq!(from.ip(), expected_source);
+        }
     }
 }
