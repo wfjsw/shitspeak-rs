@@ -30,6 +30,9 @@ struct ScriptedUser {
     language: Option<Language>,
     virtual_server_id: Option<String>,
     max_bandwidth: Option<u32>,
+    /// `Some` models an authenticator that overrides the configured welcome
+    /// text for this user.
+    welcome_text: Option<String>,
 }
 
 #[derive(Default)]
@@ -174,6 +177,7 @@ impl TestAuthenticator {
                 language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
+                welcome_text: None,
             },
         );
     }
@@ -197,6 +201,7 @@ impl TestAuthenticator {
                 language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
+                welcome_text: None,
             },
         );
     }
@@ -222,6 +227,7 @@ impl TestAuthenticator {
                 language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
+                welcome_text: None,
             },
         );
     }
@@ -238,6 +244,14 @@ impl TestAuthenticator {
     pub fn set_fqdn(&self, name: &str, fqdn: Option<&str>) {
         if let Some(user) = self.users.lock().unwrap().get_mut(name) {
             user.fqdn = fqdn.map(str::to_owned);
+        }
+    }
+
+    /// Make an already registered user's authentication result override the
+    /// configured welcome text.
+    pub fn set_welcome_text(&self, name: &str, welcome_text: Option<&str>) {
+        if let Some(user) = self.users.lock().unwrap().get_mut(name) {
+            user.welcome_text = welcome_text.map(str::to_owned);
         }
     }
 
@@ -328,6 +342,7 @@ impl TestAuthenticator {
                 language,
                 virtual_server_id: virtual_server_id.map(str::to_owned),
                 max_bandwidth,
+                welcome_text: None,
             },
         );
     }
@@ -401,6 +416,7 @@ impl Authenticator for AuthenticatorAdapter {
             virtual_server_id: entry.virtual_server_id,
             language: entry.language,
             max_bandwidth: entry.max_bandwidth,
+            welcome_text: entry.welcome_text,
             texture_url: None,
             comment_url: None,
         })

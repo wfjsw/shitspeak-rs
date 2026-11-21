@@ -218,6 +218,8 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     max_bandwidth: Option<u32>,
     #[serde(default)]
+    welcome_text: Option<String>,
+    #[serde(default)]
     texture_url: Option<String>,
     #[serde(default)]
     comment_url: Option<String>,
@@ -275,6 +277,7 @@ impl AuthenticatorJsonAuthenticateResponse {
             // the same way rather than failing the login.
             language: self.language.as_deref().and_then(Language::parse),
             max_bandwidth: self.max_bandwidth,
+            welcome_text: self.welcome_text,
             texture_url: self.texture_url,
             comment_url: self.comment_url,
             auth_session_id: self.auth_session_id,
@@ -300,6 +303,7 @@ pub(crate) fn authenticate_result_from_external_claims(
         virtual_server_id: None,
         language: None,
         max_bandwidth: None,
+        welcome_text: None,
         texture_url: None,
         comment_url: None,
         auth_session_id: None,

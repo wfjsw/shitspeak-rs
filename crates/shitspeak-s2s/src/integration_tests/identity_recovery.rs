@@ -226,6 +226,59 @@ fn spawn_probe_responder(
     });
 }
 
+/// Answer identity probes from a fixed script, one entry per reply, holding
+/// the last entry once the script is exhausted. Models a predecessor whose
+/// last hello fades out (age only grows) instead of a live node refreshing.
+fn spawn_scripted_probe_responder(
+    peer: ConnectionManager,
+    mut inbound: Inbound,
+    script: Vec<HelloObservation>,
+    shutdown: CancellationToken,
+) {
+    let floor = LsaFloor::new(0, None);
+    let lsdb = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+    tokio::spawn(async move {
+        let mut replies = 0usize;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                msg = inbound.control().recv() => {
+                    let Some(msg) = msg else { return };
+                    let Ok(decoded) = decode_message(msg.payload()) else {
+                        continue;
+                    };
+                    let Some(OverlayBody::IdentityProbe(probe)) = decoded.body else {
+                        continue;
+                    };
+                    let Ok(subject) = NodeIdentifier::try_from(probe.subject) else {
+                        continue;
+                    };
+                    let reported = vec![script[replies.min(script.len() - 1)]];
+                    replies += 1;
+                    let Some(payload) = encode_identity_probe_resp(
+                        subject,
+                        probe.nonce,
+                        &reported,
+                        &lsdb,
+                        &floor,
+                    ) else {
+                        continue;
+                    };
+                    let _ = peer
+                        .send(
+                            msg.from(),
+                            ServiceLevel::Reliable,
+                            None,
+                            MessageClass::Control,
+                            payload,
+                        )
+                        .await;
+                }
+            }
+        }
+    });
+}
+
 fn decision_counts(guard: &IdentityGuard) -> HashMap<GuardDecision, u64> {
     guard.decision_counts().into_iter().collect()
 }
@@ -533,6 +586,59 @@ async fn startup_preflight_refuses_a_sustained_live_overlay_competitor() {
     let evidence = evidence.expect("a sustained live competitor must refuse the boot");
     assert_eq!(evidence.kind(), "identity_probe");
     assert_eq!(evidence.source(), 9);
+
+    shutdown.cancel();
+    node.shutdown().await;
+}
+
+/// Restart race: the predecessor is already gone, but one of its last hellos
+/// is still in flight at a peer, so that peer reports one smaller age before
+/// the age resumes growing. A single smaller age must not fence the boot —
+/// only a stream that keeps refreshing proves a live competitor.
+#[tokio::test]
+async fn startup_preflight_ignores_one_in_flight_hello_from_a_dead_predecessor() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[2, 9]);
+    let peer_port = pick_free_port().await;
+    let node_port = pick_free_port().await;
+
+    let (peer, peer_inbound) =
+        ConnectionManager::start(transport_cfg(&pki, 1, loopback(peer_port)))
+            .await
+            .unwrap();
+    let (node, node_inbound) = ConnectionManager::start(
+        transport_cfg(&pki, 0, loopback(node_port)).with_seed_target(SeedAddress::new(
+            loopback(peer_port).to_string(),
+            TransportKind::Tcp,
+        )),
+    )
+    .await
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    // Epoch 500: one fresher hello (300 after 400), then the age only grows
+    // again — a predecessor that stopped sending, not a live impostor.
+    let script = [400u64, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750]
+        .into_iter()
+        .map(|ms| observation(500, Duration::from_millis(ms)))
+        .collect();
+    spawn_scripted_probe_responder(peer, peer_inbound, script, shutdown.clone());
+
+    let (_inbound, evidence) = crate::overlay::duplicate_startup_identity_preflight(
+        2,
+        &node,
+        node_inbound,
+        std::time::Instant::now(),
+        Duration::from_millis(1_500),
+        Duration::from_millis(200),
+        Duration::from_millis(800),
+    )
+    .await;
+
+    assert!(
+        evidence.is_none(),
+        "one in-flight hello from the dead predecessor must not fence the boot"
+    );
 
     shutdown.cancel();
     node.shutdown().await;

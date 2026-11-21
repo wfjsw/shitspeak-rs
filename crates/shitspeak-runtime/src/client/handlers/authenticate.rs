@@ -607,24 +607,29 @@ pub async fn handle_authenticate(
 
     // 4. ServerSync
     {
+        // An authenticator may personalize the welcome text; an empty string
+        // means "no override" so the configured text still applies.
+        let welcome_text = result
+            .welcome_text
+            .clone()
+            .filter(|text| !text.is_empty())
+            .or_else(|| auth_config.welcome_text.clone());
         let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         push_burst(Message::ServerSync(
             ServerSync {
                 session: Some(u32::from(session_id)),
                 max_bandwidth: Some(sender.max_bandwidth(auth_config.max_bandwidth)),
-                welcome_text: auth_config.welcome_text.clone(),
+                welcome_text: welcome_text.clone(),
                 permissions: Some(sender.advertised_permissions(root_perm)),
             }
             .into(),
         ));
-    }
 
-    // 5. ServerConfig
-    {
+        // 5. ServerConfig
         push_burst(Message::ServerConfig(
             ServerConfig {
                 max_bandwidth: None,
-                welcome_text: None,
+                welcome_text,
                 allow_html: Some(auth_config.allow_html),
                 message_length: Some(auth_config.max_text_message_length),
                 image_message_length: Some(auth_config.max_image_message_length),

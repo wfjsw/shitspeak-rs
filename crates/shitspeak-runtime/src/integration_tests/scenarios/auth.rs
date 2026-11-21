@@ -115,6 +115,33 @@ async fn auth_two_clients_succeeds() {
     assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
 }
 
+/// Checks that an authenticator-returned welcome text replaces the configured
+/// one, while an empty override keeps the configured text.
+#[tokio::test]
+async fn auth_authenticator_welcome_text_overrides_config() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .set_welcome_text("alice", Some("personal welcome"));
+    server.authenticator.set_welcome_text("bob", Some(""));
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    assert_eq!(alice.welcome_text.as_deref(), Some("personal welcome"));
+    assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
+}
+
 #[tokio::test]
 async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     let server = spawn_test_server(TestServerOpts {

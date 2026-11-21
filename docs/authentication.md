@@ -97,7 +97,7 @@ npm run build
 
 ## Authenticator Responses
 
-Successful authentication can provide identity, display name, groups, privileges, virtual server routing, language, and per-client bandwidth:
+Successful authentication can provide identity, display name, groups, privileges, virtual server routing, language, per-client bandwidth, and per-client welcome text:
 
 ```json
 {
@@ -111,6 +111,7 @@ Successful authentication can provide identity, display name, groups, privileges
   "virtual_server_id": null,
   "language": "en",
   "max_bandwidth": null,
+  "welcome_text": null,
   "texture_url": null,
   "comment_url": null,
   "authenticated_until": "2026-07-22T20:30:00Z",
@@ -119,6 +120,8 @@ Successful authentication can provide identity, display name, groups, privileges
 ```
 
 `max_bandwidth`, when present, overrides the configured `max_bandwidth` value advertised to that authenticated client.
+
+`welcome_text`, when present and non-empty, replaces the configured `welcome_text` in the `ServerSync` and `ServerConfig` messages sent to that authenticated client. Omit it, send `null`, or send an empty string to keep the configured text.
 
 `language` selects the language of server-generated text for this client. Omit it (or send `null`) to leave the choice to the server's `default_language`. Any BCP-47 tag is accepted and matched against the available translations, so `es-MX` is served by Spanish and `zh-CN` by Simplified Chinese. Channel names are translated for the same language when [channel-name translation](localization.md#channel-names) is configured, unless the user holds `no_channel_name_translation`. A language without a translation falls back to English, or for channel names to the names as entered. Text that is not a language tag is treated like an absent `language`. The server's `force_language` setting, when configured, overrides this field. A reauthentication that returns a different language switches the client over, including channel names it has already received. See [Configuration](configuration.md#localization).
 

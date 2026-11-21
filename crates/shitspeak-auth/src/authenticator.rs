@@ -96,6 +96,9 @@ pub struct AuthenticateResult {
     /// Optional per-client maximum bandwidth advertised to the authenticated
     /// client. `None` uses the server-wide `max_bandwidth` config value.
     pub max_bandwidth: Option<u32>,
+    /// Optional welcome text sent to this client in place of the configured
+    /// `welcome_text`. `None` (and an empty string) keeps the configured text.
+    pub welcome_text: Option<String>,
     /// Optional URL for the user's texture/avatar blob.
     /// When present the server fetches this URL, SHA-1s the content,
     /// and stores it in `SessionBlobStore`.
@@ -200,6 +203,7 @@ pub trait Authenticator: Send + Sync + 'static {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
             auth_session_id: None,

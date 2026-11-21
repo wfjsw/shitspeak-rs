@@ -153,6 +153,7 @@ fn result(label: &str) -> AuthenticateResult {
         virtual_server_id: None,
         language: None,
         max_bandwidth: None,
+        welcome_text: None,
         texture_url: None,
         comment_url: None,
         auth_session_id: None,

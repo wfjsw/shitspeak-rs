@@ -110,6 +110,7 @@ impl Authenticator for TestAuthenticator {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         })
@@ -1048,6 +1049,7 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1163,6 +1165,7 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1476,6 +1479,7 @@ async fn authentication_expiry_reauth_applies_invisible_transitions() {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1513,6 +1517,7 @@ async fn authentication_expiry_reauth_applies_invisible_transitions() {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1562,6 +1567,7 @@ async fn reauthentication_sends_new_authenticator_bandwidth_to_client() {
             virtual_server_id: None,
             language: None,
             max_bandwidth: Some(24_000),
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1620,6 +1626,7 @@ async fn reauthentication_with_a_new_language_refreshes_localized_client_state()
             virtual_server_id: None,
             language: Language::parse("es"),
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1753,6 +1760,7 @@ async fn reauthentication_flipping_no_channel_name_translation_refreshes_channel
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1793,6 +1801,7 @@ async fn reauthentication_flipping_no_channel_name_translation_refreshes_channel
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1843,6 +1852,7 @@ async fn reauthentication_clearing_bandwidth_override_follows_config() {
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1906,6 +1916,7 @@ async fn authentication_expiry_reauth_kicks_registered_client_when_user_id_is_re
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -1959,6 +1970,7 @@ async fn authentication_expiry_reauth_kicks_client_when_auth_session_id_changes_
                 virtual_server_id: None,
                 language: None,
                 max_bandwidth: None,
+                welcome_text: None,
                 texture_url: None,
                 comment_url: None,
             }))
@@ -2014,6 +2026,7 @@ async fn authentication_expiry_reauth_kicks_client_when_virtual_server_id_change
             virtual_server_id: Some("other-server".to_owned()),
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
@@ -2103,6 +2116,7 @@ async fn authentication_expiry_reauth_moves_user_to_default_after_losing_travers
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,
+            welcome_text: None,
             texture_url: None,
             comment_url: None,
         }))
