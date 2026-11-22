@@ -473,6 +473,15 @@ pub async fn duplicate_startup_identity_preflight(
         .await
         {
             if let Some(response) = identity::IdentityProbeResponse::decode(msg.payload()) {
+                if std::env::var_os("S2S_PREFLIGHT_TRACE").is_some() {
+                    eprintln!(
+                        "resp from={} subject={} local={} epochs={:?}",
+                        msg.from(),
+                        response.subject,
+                        local_node,
+                        response.hello_epochs
+                    );
+                }
                 if response.subject == local_node
                     && live.observe_report(msg.from(), &response.hello_epochs, "identity_probe")
                 {
@@ -548,23 +557,35 @@ pub async fn duplicate_startup_identity_preflight(
 /// age is being *refreshed*. For a dead process the age grows in lockstep with
 /// the wall clock; for a live one the hello stream keeps it cycling.
 ///
-/// `observe_report` therefore returns true only when the same peer has
-/// reported the same epoch with a strictly smaller age than before — a newer
-/// hello arrived between that peer's two sightings.
+/// `observe_report` therefore returns true only after the same peer has
+/// reported the same epoch with a smaller age twice, spread over a hello
+/// interval. A predecessor torn down a moment ago leaves a single hello in
+/// flight and fails that bar; a live competitor refreshes once per interval
+/// and passes it.
 struct LiveSightings {
+    hello_interval: Duration,
     hello_dead_interval: Duration,
-    /// First sighting time and the most recent age, per (reporting peer, epoch).
+    /// First refresh time, most recent refresh time and age, per (reporting
+    /// peer, epoch).
     ///
     /// Keyed by peer as well as epoch: each peer reports its own view of a
     /// hello's age, so two peers' reports of the same epoch are not
     /// comparable. Only one peer reporting a fresher hello than it did before
     /// means that peer saw a new hello arrive.
-    seen: std::collections::HashMap<(NodeIdentifier, u64), (std::time::Instant, Duration)>,
+    seen: std::collections::HashMap<(NodeIdentifier, u64), Sighting>,
+}
+
+/// One peer's sightings of one foreign epoch.
+struct Sighting {
+    first_refresh_at: std::time::Instant,
+    age: Duration,
+    refreshes: u32,
 }
 
 impl LiveSightings {
-    fn new(_hello_interval: Duration, hello_dead_interval: Duration) -> Self {
+    fn new(hello_interval: Duration, hello_dead_interval: Duration) -> Self {
         Self {
+            hello_interval,
             hello_dead_interval,
             seen: std::collections::HashMap::new(),
         }
@@ -572,7 +593,10 @@ impl LiveSightings {
 
     /// When the first live observation was recorded.
     fn first_sighting_at(&self) -> Option<std::time::Instant> {
-        self.seen.values().map(|(at, _)| *at).min()
+        self.seen
+            .values()
+            .map(|sighting| sighting.first_refresh_at)
+            .min()
     }
 
     fn observe_report(
@@ -594,21 +618,44 @@ impl LiveSightings {
                 hello_age_ms = observation.age.as_millis() as u64,
                 "startup preflight: live overlay observation of this node id"
             );
-            match self.seen.entry((source, observation.boot_epoch)) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let (first_at, previous_age) = *entry.get();
-                    if observation.age < previous_age {
-                        // The hello stream refreshed between this peer's two
-                        // sightings: the process is alive. A departed
-                        // predecessor only ages in lockstep with the wall
-                        // clock, so it can never satisfy this.
-                        return true;
-                    }
-                    entry.insert((first_at, observation.age));
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((now, observation.age));
-                }
+            let sighting = self
+                .seen
+                .entry((source, observation.boot_epoch))
+                .or_insert_with(|| Sighting {
+                    first_refresh_at: now,
+                    age: observation.age,
+                    refreshes: 0,
+                });
+            let refreshed = observation.age < sighting.age;
+            // Track the newest age even when it grew: a later hello must be
+            // compared against the latest sighting, not the smallest one ever
+            // seen, or the peer's view would stick at its minimum.
+            sighting.age = observation.age;
+            if !refreshed {
+                continue;
+            }
+            // A newer hello arrived between this peer's two sightings. One
+            // such arrival is not enough: a predecessor torn down a moment
+            // ago leaves exactly one hello already in flight, which looks
+            // identical. A live competitor keeps refreshing once per hello
+            // interval, so require a second refresh spread over a full
+            // interval before fencing the boot.
+            sighting.age = observation.age;
+            sighting.refreshes += 1;
+            if std::env::var_os("S2S_PREFLIGHT_TRACE").is_some() {
+                eprintln!(
+                    "observe src={} epoch={} age={:?} refreshes={} span={:?}",
+                    source,
+                    observation.boot_epoch,
+                    observation.age,
+                    sighting.refreshes,
+                    now.saturating_duration_since(sighting.first_refresh_at)
+                );
+            }
+            if sighting.refreshes >= 2
+                && now.saturating_duration_since(sighting.first_refresh_at) >= self.hello_interval
+            {
+                return true;
             }
         }
         false
@@ -627,11 +674,27 @@ mod live_sightings_tests {
     }
 
     #[test]
-    fn a_peer_reporting_a_refreshed_hello_proves_the_competitor_is_alive() {
-        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(800));
+    fn a_peer_reporting_a_sustained_refresh_proves_the_competitor_is_alive() {
+        let mut live = LiveSightings::new(Duration::from_millis(1), Duration::from_millis(800));
         assert!(!live.observe_report(1, &[reported(500, 300)], "probe"));
-        // The same peer saw a newer hello: age went down.
-        assert!(live.observe_report(1, &[reported(500, 40)], "probe"));
+        // First fresh hello: real, but a torn-down predecessor leaves one of
+        // these too, so it is not yet proof.
+        assert!(!live.observe_report(1, &[reported(500, 40)], "probe"));
+        std::thread::sleep(Duration::from_millis(3));
+        // A second refresh a hello interval later: a live stream.
+        assert!(live.observe_report(1, &[reported(500, 20)], "probe"));
+    }
+
+    #[test]
+    fn one_in_flight_hello_from_a_dead_predecessor_does_not_prove_liveness() {
+        let mut live = LiveSightings::new(Duration::from_millis(200), Duration::from_millis(800));
+        assert!(!live.observe_report(1, &[reported(500, 400)], "probe"));
+        // The predecessor's last hello lands after it died.
+        assert!(!live.observe_report(1, &[reported(500, 300)], "probe"));
+        // Nothing else arrives; the age only grows by the wall clock.
+        for age_ms in [350u64, 400, 450, 500, 550, 600] {
+            assert!(!live.observe_report(1, &[reported(500, age_ms)], "probe"));
+        }
     }
 
     #[test]

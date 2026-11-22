@@ -62,7 +62,7 @@ use shitspeak_s2s::status as s2s_status;
 #[cfg(any(test, feature = "pre-release-workload"))]
 use shitspeak_s2s::testing as s2s_testing;
 use shitspeak_s2s_transport as s2s_transport;
-use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
+use shitspeak_s2s_transport::{ConnectionManager, Inbound, TransportConfig};
 
 #[cfg(feature = "pre-release-workload")]
 mod pre_release_workload;
@@ -90,6 +90,26 @@ const S2S_VOICE_GATEWAY_MIN_SHARDS: usize = 2;
 const S2S_VOICE_GATEWAY_MAX_SHARDS: usize = 16;
 const OBSERVABILITY_GEO_RETRY_INITIAL_INTERVAL: Duration = Duration::from_secs(1);
 const OBSERVABILITY_GEO_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
+
+const STARTUP_RETRY_BASE: Duration = Duration::from_secs(5);
+const STARTUP_RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// Backoff before the next S2S startup attempt. Short enough to recover from a
+/// predecessor that just went away, capped so a real competitor cannot make
+/// the node spin.
+fn startup_retry_delay(attempt: u32) -> Duration {
+    STARTUP_RETRY_BASE
+        .saturating_mul(1u32 << attempt.min(4))
+        .min(STARTUP_RETRY_CAP)
+}
+
+/// Sleep for `delay`; false when shutdown arrives first.
+async fn wait_startup_retry(shutdown: &mut watch::Receiver<()>, delay: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.changed() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -1732,6 +1752,88 @@ impl S2SManager {
         self.reincarnation.lock().take()
     }
 
+    /// Start the transport and pass the duplicate-identity preflight, retrying
+    /// with backoff. `None` means shutdown arrived first.
+    async fn start_transport_after_preflight(
+        &self,
+        shutdown: &mut watch::Receiver<()>,
+        transport_config: TransportConfig,
+    ) -> Option<(ConnectionManager, Inbound)> {
+        let mut attempt = 0u32;
+        loop {
+            let incarnation_start = Instant::now();
+            let (transport, inbound) = match ConnectionManager::start(transport_config.clone()).await
+            {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let retry_in = startup_retry_delay(attempt);
+                    warn!(%error, attempt, ?retry_in, "s2s transport startup failed; retrying");
+                    if !wait_startup_retry(shutdown, retry_in).await {
+                        return None;
+                    }
+                    attempt += 1;
+                    continue;
+                }
+            };
+            #[cfg(any(test, feature = "pre-release-workload"))]
+            let inbound = {
+                let chaos = self.state.read().inbound_chaos.clone();
+                if let Some(chaos) = chaos {
+                    chaos.install(inbound)
+                } else {
+                    inbound
+                }
+            };
+
+            let local_node = transport.local_node_id();
+            // Seed dials settle first: they are what reach a process already
+            // holding this identity. Refusal notices for those sessions arrive
+            // within a round trip of the dial. S2S is refused only on evidence
+            // that a competitor is live on the overlay, not merely present.
+            let transport_settle = self
+                .overlay_config
+                .hello_interval()
+                .saturating_mul(2)
+                .min(self.overlay_config.hello_dead_interval())
+                .clamp(Duration::from_millis(250), Duration::from_secs(2));
+            let (inbound, evidence) = s2s_overlay::duplicate_startup_identity_preflight(
+                local_node,
+                &transport,
+                inbound,
+                incarnation_start,
+                transport_settle,
+                self.overlay_config.hello_interval(),
+                self.overlay_config.hello_dead_interval(),
+            )
+            .await;
+            let Some(evidence) = evidence else {
+                return Some((transport, inbound));
+            };
+
+            let retry_in = startup_retry_delay(attempt);
+            warn!(
+                node = local_node,
+                source = evidence.source(),
+                kind = evidence.kind(),
+                remote = ?evidence.remote(),
+                attempt,
+                ?retry_in,
+                "s2s startup refused: duplicate local node id observed on the network; retrying"
+            );
+            {
+                let mut state = self.state.write();
+                state.startup_duplicate_failures =
+                    state.startup_duplicate_failures.saturating_add(1);
+                state.last_startup_duplicate_node = Some(local_node);
+            }
+            transport.shutdown().await;
+            if !wait_startup_retry(shutdown, retry_in).await {
+                return None;
+            }
+            attempt += 1;
+        }
+    }
+
     async fn run_runtime(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
@@ -1742,10 +1844,8 @@ impl S2SManager {
         // When this S2S incarnation began. A hello older than this can only
         // belong to an earlier incarnation of this very node, never to a
         // live competitor.
-        let incarnation_start = std::time::Instant::now();
         if !self.enabled {
             self.clear_gateway_tx();
-            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         }
@@ -1753,7 +1853,6 @@ impl S2SManager {
         if let Some(error) = &self.config_error {
             warn!(error = %error, "s2s startup skipped");
             self.clear_gateway_tx();
-            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         }
@@ -1761,72 +1860,20 @@ impl S2SManager {
         let Some(transport_config) = self.transport_config.clone() else {
             warn!("s2s startup skipped: no transport config");
             self.clear_gateway_tx();
-            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         };
 
-        let (transport, inbound) = match ConnectionManager::start(transport_config).await {
-            Ok(parts) => parts,
-            Err(e) => {
-                warn!(error = %e, "s2s transport startup failed");
-                self.clear_gateway_tx();
-                drop(gateways);
-                let _ = shutdown.changed().await;
-                return;
-            }
-        };
-        #[cfg(any(test, feature = "pre-release-workload"))]
-        let inbound = {
-            let chaos = self.state.read().inbound_chaos.clone();
-            if let Some(chaos) = chaos {
-                chaos.install(inbound)
-            } else {
-                inbound
-            }
-        };
-
-        let local_node = transport.local_node_id();
-        // Seed dials settle first: they are what reach a process already
-        // holding this identity. Refusal notices for those sessions arrive
-        // within a round trip of the dial. S2S is refused only on evidence
-        // that a competitor is live on the overlay, not merely present.
-        let transport_settle = self
-            .overlay_config
-            .hello_interval()
-            .saturating_mul(2)
-            .min(self.overlay_config.hello_dead_interval())
-            .clamp(Duration::from_millis(250), Duration::from_secs(2));
-        let (inbound, evidence) = s2s_overlay::duplicate_startup_identity_preflight(
-            local_node,
-            &transport,
-            inbound,
-            incarnation_start,
-            transport_settle,
-            self.overlay_config.hello_interval(),
-            self.overlay_config.hello_dead_interval(),
-        )
-        .await;
-        if let Some(evidence) = evidence {
-            error!(
-                node = local_node,
-                source = evidence.source(),
-                kind = evidence.kind(),
-                remote = ?evidence.remote(),
-                "fatal s2s startup failure: duplicate local node id observed on the network; disabling S2S for this server process"
-            );
-            {
-                let mut state = self.state.write();
-                state.startup_duplicate_failures =
-                    state.startup_duplicate_failures.saturating_add(1);
-                state.last_startup_duplicate_node = Some(local_node);
-            }
-            transport.shutdown().await;
+        // A refused startup is usually a predecessor that has not aged out of
+        // the overlay yet, so retry instead of staying disabled until the next
+        // process restart.
+        let Some((transport, inbound)) = self
+            .start_transport_after_preflight(&mut shutdown, transport_config)
+            .await
+        else {
             self.clear_gateway_tx();
-            drop(gateways);
-            let _ = shutdown.changed().await;
             return;
-        }
+        };
 
         let local_geo = self.local_geo.clone();
 
@@ -1843,7 +1890,6 @@ impl S2SManager {
                 warn!(error = %e, "s2s overlay startup failed");
                 transport.shutdown().await;
                 self.clear_gateway_tx();
-                drop(gateways);
                 let _ = shutdown.changed().await;
                 return;
             }
@@ -6597,5 +6643,21 @@ mod tests {
             rx.try_recv().is_err(),
             "duplicate snapshot is side-effect free"
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_retry_tests {
+    use super::startup_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        assert_eq!(startup_retry_delay(0), Duration::from_secs(5));
+        assert_eq!(startup_retry_delay(1), Duration::from_secs(10));
+        assert_eq!(startup_retry_delay(2), Duration::from_secs(20));
+        assert_eq!(startup_retry_delay(3), Duration::from_secs(40));
+        assert_eq!(startup_retry_delay(4), Duration::from_secs(60));
+        assert_eq!(startup_retry_delay(9), Duration::from_secs(60));
     }
 }

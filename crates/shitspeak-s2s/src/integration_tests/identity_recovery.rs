@@ -202,6 +202,9 @@ fn spawn_probe_responder(
                         })
                         .collect();
                     replies += 1;
+                    if std::env::var_os("S2S_PREFLIGHT_TRACE").is_some() {
+                        eprintln!("responder reply={} age={:?}", replies, reported[0].age);
+                    }
                     let Some(payload) = encode_identity_probe_resp(
                         subject,
                         probe.nonce,
